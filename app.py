@@ -157,6 +157,15 @@ with col_a:
 with col_b:
     calculate = st.button("Calculate", width="stretch")
 
+st.caption(
+    "🇭🇰 **Hong Kong stocks**: use the full Yahoo Finance format, including the leading "
+    "zero and the .HK suffix - e.g. Tencent is **0700.HK**, not 700.HK or 700.  \n"
+    "🏦 **Banks and insurers**: this calculator isn't suitable for them. Standard "
+    "discounted cash flow doesn't map cleanly onto how financial-sector companies report "
+    "(interest income/expense instead of a normal revenue and cost structure) - results "
+    "for tickers like this will likely be wrong or fail to load at all."
+)
+
 if "results" not in st.session_state:
     st.session_state.results = None
 
@@ -292,13 +301,19 @@ if st.session_state.results:
     st.metric("WACC used", f"{wacc:.2%}", wacc_source)
 
     # ------------------------------------------------------------------
-    # Sensitivity grid
+    # Sensitivity grid - 10x10, matching the Excel template's convention.
+    # With an even grid size there's no single true-center cell, so (like
+    # the Excel version) the 4 cells nearest the actual current WACC/growth
+    # assumptions get a highlighted border instead of just one cell.
     # ------------------------------------------------------------------
     st.subheader("Sensitivity grid")
-    st.caption("Price across nearby WACC and terminal growth assumptions.")
+    st.caption("Price across nearby WACC and terminal growth assumptions. "
+               "The 4 bordered cells in the middle are closest to your actual current assumptions.")
 
-    wacc_steps = [wacc + d for d in [-0.02, -0.01, 0, 0.01, 0.02]]
-    growth_steps = [terminal_growth + d for d in [-0.01, -0.005, 0, 0.005, 0.01]]
+    wacc_deltas = [(i - 4.5) * 0.005 for i in range(10)]      # +/- 2.25%, 0.5% steps
+    growth_deltas = [(i - 4.5) * 0.0025 for i in range(10)]   # +/- 1.125%, 0.25% steps
+    wacc_steps = [wacc + d for d in wacc_deltas]
+    growth_steps = [terminal_growth + d for d in growth_deltas]
 
     grid = []
     for g in growth_steps:
@@ -321,27 +336,47 @@ if st.session_state.results:
     def fmt_cell(v):
         return f"${v:,.0f}" if v is not None else "n/a"
 
-    def color_scale(val, vmin, vmax):
-        """Lightweight red-to-green color scale, self-contained (no matplotlib
-        dependency) - a prior version used pandas' background_gradient(), which
-        needs matplotlib as an optional dependency that wasn't in
-        requirements.txt and broke the deployed app. This avoids that whole
-        class of missing-dependency risk."""
+    def cell_bg(val, vmin, vmax):
+        """Muted, desaturated red-to-green background gradient - self-contained,
+        no matplotlib dependency (see earlier note on why background_gradient()
+        broke the deployed app). Deliberately desaturated rather than vivid,
+        since a vivid red background and orange text share the same dominant
+        color channel and produce genuinely poor contrast no matter how dark
+        the text gets - verified this against actual WCAG contrast math
+        before picking these specific tones, not just by eye."""
         if val is None or vmax == vmin:
-            return ""
+            return (240, 240, 240)
         frac = max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
-        # red (low) -> yellow (mid) -> green (high)
         if frac < 0.5:
-            r, g, b = 235, int(120 + frac * 2 * 110), 120
+            base, target, t = (228, 188, 188), (225, 210, 165), frac * 2
         else:
-            r, g, b = int(235 - (frac - 0.5) * 2 * 115), 220, 120
-        return f"background-color: rgb({r},{g},{b}); color: #1A1F2E; font-weight: 500;"
+            base, target, t = (225, 210, 165), (185, 210, 185), (frac - 0.5) * 2
+        return tuple(int(base[i] + (target[i] - base[i]) * t) for i in range(3))
 
     flat_vals = [v for row in grid for v in row if v is not None]
     vmin, vmax = (min(flat_vals), max(flat_vals)) if flat_vals else (0, 1)
 
+    def style_grid(data):
+        """Combined position + value aware styling: background color from
+        the value (via cell_bg), orange text throughout (verified >=3:1
+        contrast against every point on the gradient above), and a red
+        border on the 4 center cells specifically."""
+        n_rows, n_cols = data.shape
+        center_rows = {n_rows // 2 - 1, n_rows // 2}
+        center_cols = {n_cols // 2 - 1, n_cols // 2}
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+        for i in range(n_rows):
+            for j in range(n_cols):
+                val = data.iloc[i, j]
+                r_, g_, b_ = cell_bg(val, vmin, vmax)
+                css = f"background-color: rgb({r_},{g_},{b_}); color: #B8410A; font-weight: 600;"
+                if i in center_rows and j in center_cols:
+                    css += " border: 3px solid #CC0000;"
+                styles.iloc[i, j] = css
+        return styles
+
     st.dataframe(
-        grid_df.style.format(fmt_cell).map(lambda v: color_scale(v, vmin, vmax)),
+        grid_df.style.format(fmt_cell).apply(style_grid, axis=None),
         width="stretch",
     )
 
