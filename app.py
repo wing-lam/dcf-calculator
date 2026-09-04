@@ -299,6 +299,7 @@ if calculate and ticker_input:
             beta = safe_float(info.get("beta")) or 1.0
             target_price = safe_float(info.get("targetMeanPrice"))
             n_analysts = info.get("numberOfAnalystOpinions")
+            forward_pe = safe_float(info.get("forwardPE"))
             company_name = info.get("longName") or info.get("shortName") or ticker_input
 
             if price is None or shares is None:
@@ -345,7 +346,7 @@ if calculate and ticker_input:
                     st.session_state.results = dict(
                         ticker=ticker_input, company_name=company_name, price=price,
                         shares=shares / 1e6, debt=debt / 1e6, cash=cash / 1e6, beta=beta,
-                        target_price=target_price, n_analysts=n_analysts,
+                        target_price=target_price, n_analysts=n_analysts, forward_pe=forward_pe,
                         revenue_last=revenue_last / 1e6, cogs_pct=cogs_pct, sga_pct=sga_pct,
                         rd_pct=rd_pct, da_pct=da_pct, capex_pct=capex_pct, nwc_pct=nwc_pct,
                         tax_rate=tax_rate, ebit_margin=ebit_margin, growth_y1=y1, y1_source=y1_source,
@@ -571,44 +572,83 @@ if st.session_state.results:
             if len(series) > 1:
                 mean = series.mean()
                 sd = series.std()
-                stats[metric] = dict(mean=mean, sd=sd, plus1=mean + sd, minus1=mean - sd)
+                current = series.iloc[-1]  # most recent trading day's trailing multiple
+                stats[metric] = dict(mean=mean, sd=sd, plus1=mean + sd, minus1=mean - sd,
+                                      current=current)
             else:
-                stats[metric] = dict(mean=None, sd=None, plus1=None, minus1=None)
+                stats[metric] = dict(mean=None, sd=None, plus1=None, minus1=None, current=None)
 
         def fmt_x(v):
             return f"{v:.1f}x" if v is not None else "N/A"
 
         stats_df = pd.DataFrame({
             "P/E": [fmt_x(stats["pe"]["mean"]), fmt_x(stats["pe"]["sd"]),
-                    fmt_x(stats["pe"]["plus1"]), fmt_x(stats["pe"]["minus1"])],
+                    fmt_x(stats["pe"]["plus1"]), fmt_x(stats["pe"]["minus1"]),
+                    fmt_x(stats["pe"]["current"])],
             "P/S": [fmt_x(stats["ps"]["mean"]), fmt_x(stats["ps"]["sd"]),
-                    fmt_x(stats["ps"]["plus1"]), fmt_x(stats["ps"]["minus1"])],
+                    fmt_x(stats["ps"]["plus1"]), fmt_x(stats["ps"]["minus1"]),
+                    fmt_x(stats["ps"]["current"])],
             "P/B": [fmt_x(stats["pb"]["mean"]), fmt_x(stats["pb"]["sd"]),
-                    fmt_x(stats["pb"]["plus1"]), fmt_x(stats["pb"]["minus1"])],
-        }, index=["Mean", "Std Dev", "+1 SD", "-1 SD"])
+                    fmt_x(stats["pb"]["plus1"]), fmt_x(stats["pb"]["minus1"]),
+                    fmt_x(stats["pb"]["current"])],
+        }, index=["Mean", "Std Dev", "+1 SD", "-1 SD", "Current"])
 
         st.dataframe(stats_df, width="stretch")
 
-        pe_chart_df = val_hist_df[["date", "pe"]].dropna()
-        if not pe_chart_df.empty and stats["pe"]["mean"] is not None:
+        metric_choice = st.selectbox("Chart metric", ["P/E", "P/S", "P/B"])
+        metric_key = {"P/E": "pe", "P/S": "ps", "P/B": "pb"}[metric_choice]
+
+        chart_df = val_hist_df[["date", metric_key]].dropna()
+        m_stats = stats[metric_key]
+
+        if not chart_df.empty and m_stats["mean"] is not None:
             import altair as alt
 
-            base = alt.Chart(pe_chart_df).mark_line(color="#1F3864").encode(
-                x=alt.X("date:T", title="Date"),
-                y=alt.Y("pe:Q", title="P/E"),
+            # Combined "Mon YYYY" tick labels - a plain two-line stacked
+            # month/year axis isn't reliably renderable without a live
+            # browser to verify against, so this achieves the same goal
+            # (always knowing which year a point belongs to) with a format
+            # that's simple and guaranteed to render correctly.
+            x_axis = alt.Axis(title="Date", format="%b %Y", labelAngle=-40, tickCount="month")
+
+            base = alt.Chart(chart_df).mark_line(color="#1F3864").encode(
+                x=alt.X("date:T", axis=x_axis),
+                y=alt.Y(f"{metric_key}:Q", title=metric_choice),
             )
-            mean_line = alt.Chart(pd.DataFrame({"y": [stats["pe"]["mean"]]})).mark_rule(
+            mean_line = alt.Chart(pd.DataFrame({"y": [m_stats["mean"]]})).mark_rule(
                 color="#5B5F6B", strokeDash=[4, 4]
             ).encode(y="y:Q")
-            plus1_line = alt.Chart(pd.DataFrame({"y": [stats["pe"]["plus1"]]})).mark_rule(
+            plus1_line = alt.Chart(pd.DataFrame({"y": [m_stats["plus1"]]})).mark_rule(
                 color="#2D6A4F", strokeDash=[2, 2]
             ).encode(y="y:Q")
-            minus1_line = alt.Chart(pd.DataFrame({"y": [stats["pe"]["minus1"]]})).mark_rule(
+            minus1_line = alt.Chart(pd.DataFrame({"y": [m_stats["minus1"]]})).mark_rule(
                 color="#A13D3D", strokeDash=[2, 2]
             ).encode(y="y:Q")
 
-            st.altair_chart(base + mean_line + plus1_line + minus1_line, width="stretch")
-            st.caption("Grey dashed = mean. Green dashed = +1 SD. Red dashed = -1 SD.")
+            layers = base + mean_line + plus1_line + minus1_line
+            caption = "Grey dashed = mean. Green dashed = +1 SD. Red dashed = -1 SD."
+
+            # Forward P/E marker - a red dot at today's date, matching the
+            # Excel template's chart. Only meaningful for P/E specifically:
+            # "forward P/S" and "forward P/B" aren't standard concepts the
+            # way forward P/E is (there's no equivalent forward revenue-
+            # per-share or book-value-per-share figure fetched here), so
+            # - same as the Excel tool - this marker only appears on the
+            # P/E view, not P/S or P/B.
+            if metric_key == "pe" and r.get("forward_pe") is not None:
+                marker_df = pd.DataFrame({
+                    "date": [chart_df["date"].max()],
+                    "pe": [r["forward_pe"]],
+                })
+                marker = alt.Chart(marker_df).mark_point(
+                    color="#CC0000", size=120, filled=True
+                ).encode(x="date:T", y="pe:Q")
+                layers = layers + marker
+                caption += f" Red dot = forward P/E ({r['forward_pe']:.1f}x)."
+
+            st.altair_chart(layers, width="stretch")
+            st.caption(caption)
+
 
 st.divider()
 st.caption(
@@ -616,4 +656,3 @@ st.caption(
     "Want the full version with peer comparison and valuation history? "
     "[Download the free Excel template](https://youtube.com/@stock_with_claude)."
 )
-
