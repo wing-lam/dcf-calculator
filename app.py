@@ -1,4 +1,4 @@
-"
+"""
 app.py - Stock with Claude: Live DCF Valuation Calculator (V1)
 ----------------------------------------------------------------
 (c) 2026 Stock with Claude. Free for personal use - not for resale or
