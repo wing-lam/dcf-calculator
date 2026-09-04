@@ -88,9 +88,12 @@ def get_da(income_stmt_col):
     return None
 
 
-def fetch_growth_estimates(ticker_obj):
-    """Same schema-aware fetch as update_model.py - checks both known
-    column-name and index-label variants Yahoo has used."""
+def fetch_eps_growth_estimates(ticker_obj):
+    """Fetches from t.growth_estimates - despite the generic name, this is
+    Yahoo's EARNINGS (EPS) growth estimate table, matching Yahoo's own
+    'Growth Estimates' page which is EPS-focused, not revenue. Kept the same
+    schema-aware fetch as before (checks both known column-name and
+    index-label variants Yahoo has used)."""
     growth_y1 = growth_y2 = growth_5y = None
     try:
         analysis = ticker_obj.growth_estimates
@@ -113,6 +116,26 @@ def fetch_growth_estimates(ticker_obj):
                     growth_5y = safe_float(analysis.loc[ltg_label].get(stock_col))
                     break
     return growth_y1, growth_y2, growth_5y
+
+
+def fetch_revenue_growth_estimates(ticker_obj):
+    """Fetches from t.revenue_estimate - Yahoo's actual REVENUE-specific
+    consensus growth table, separate from the EPS-focused one above. This
+    is what should genuinely drive a DCF's revenue projection, since EPS
+    growth and revenue growth aren't the same thing (margin changes, share
+    buybacks etc. mean they can diverge)."""
+    growth_y1 = growth_y2 = None
+    try:
+        analysis = ticker_obj.revenue_estimate
+    except Exception:
+        analysis = None
+
+    if analysis is not None and not analysis.empty and "growth" in analysis.columns:
+        if "0y" in analysis.index:
+            growth_y1 = safe_float(analysis.loc["0y"].get("growth"))
+        if "+1y" in analysis.index:
+            growth_y2 = safe_float(analysis.loc["+1y"].get("growth"))
+    return growth_y1, growth_y2
 
 
 def project_fcf(revenue_last, ebit_margin, da_pct, capex_pct, nwc_pct, tax_rate, growth_path):
@@ -182,6 +205,65 @@ def dcf_implied_price(fcf_list, wacc, terminal_growth, net_debt, shares):
     return equity_value / shares
 
 
+def fetch_valuation_history(ticker_obj, income_stmt, balance_sheet):
+    """5-year daily P/E, P/S, P/B history - same approach as the Excel
+    template's Valuation History tab: a daily price line stepped against
+    each fiscal year's actual reported EPS / revenue-per-share /
+    book-value-per-share (not a smoothed or interpolated series - each day
+    uses whichever fiscal year had most recently reported as of that date).
+    Returns a DataFrame with columns date, pe, ps, pb - rows where the
+    relevant fundamental wasn't available are simply left out, not guessed.
+    """
+    try:
+        hist = ticker_obj.history(period="5y")
+    except Exception:
+        return pd.DataFrame(columns=["date", "pe", "ps", "pb"])
+
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return pd.DataFrame(columns=["date", "pe", "ps", "pb"])
+
+    # Build a lookup of fiscal-year-end date -> (EPS, revenue, book value per share)
+    fy_data = []
+    for col in income_stmt.columns:
+        eps = safe_float(income_stmt[col].get("Diluted EPS"))
+        revenue = safe_float(income_stmt[col].get("Total Revenue"))
+        shares_out = safe_float(income_stmt[col].get("Diluted Average Shares"))
+        book_value = None
+        if balance_sheet is not None and col in balance_sheet.columns:
+            book_value = safe_float(balance_sheet[col].get("Stockholders Equity"))
+        rev_per_share = (revenue / shares_out) if (revenue and shares_out) else None
+        book_per_share = (book_value / shares_out) if (book_value and shares_out) else None
+        try:
+            fy_end = pd.Timestamp(col).tz_localize(None)
+        except Exception:
+            continue
+        fy_data.append((fy_end, eps, rev_per_share, book_per_share))
+
+    fy_data.sort(key=lambda x: x[0])
+    if not fy_data:
+        return pd.DataFrame(columns=["date", "pe", "ps", "pb"])
+
+    rows = []
+    hist_index = hist.index.tz_localize(None) if hist.index.tz is not None else hist.index
+    for date, price in zip(hist_index, hist["Close"]):
+        # find the most recent fiscal year-end at or before this date
+        applicable = None
+        for fy_end, eps, rps, bps in fy_data:
+            if fy_end <= date:
+                applicable = (eps, rps, bps)
+            else:
+                break
+        if applicable is None:
+            continue
+        eps, rps, bps = applicable
+        pe = (price / eps) if (eps and eps > 0) else None
+        ps = (price / rps) if (rps and rps > 0) else None
+        pb = (price / bps) if (bps and bps > 0) else None
+        rows.append(dict(date=date, pe=pe, ps=ps, pb=pb))
+
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Input
 # ---------------------------------------------------------------------------
@@ -249,11 +331,16 @@ if calculate and ticker_input:
                     # docstring on project_fcf for why this matters.
                     ebit_margin = ebit_last / revenue_last
 
-                    growth_y1, growth_y2, growth_5y = fetch_growth_estimates(t)
+                    rev_growth_y1, rev_growth_y2 = fetch_revenue_growth_estimates(t)
+                    eps_growth_y1, eps_growth_y2, eps_growth_5y = fetch_eps_growth_estimates(t)
                     rev_growth_trailing = safe_float(info.get("revenueGrowth"))
 
-                    y1 = growth_y1 if growth_y1 is not None else (rev_growth_trailing or 0.05)
-                    y1_source = "Analyst" if growth_y1 is not None else "Trailing (proxy)"
+                    # The DCF's actual growth driver: genuine revenue growth where
+                    # available, trailing revenue growth as a last-resort proxy -
+                    # never EPS growth, which is a different thing (see the two
+                    # fetch functions' docstrings above).
+                    y1 = rev_growth_y1 if rev_growth_y1 is not None else (rev_growth_trailing or 0.05)
+                    y1_source = "Analyst" if rev_growth_y1 is not None else "Trailing (proxy)"
 
                     st.session_state.results = dict(
                         ticker=ticker_input, company_name=company_name, price=price,
@@ -262,7 +349,8 @@ if calculate and ticker_input:
                         revenue_last=revenue_last / 1e6, cogs_pct=cogs_pct, sga_pct=sga_pct,
                         rd_pct=rd_pct, da_pct=da_pct, capex_pct=capex_pct, nwc_pct=nwc_pct,
                         tax_rate=tax_rate, ebit_margin=ebit_margin, growth_y1=y1, y1_source=y1_source,
-                        growth_y2=growth_y2, growth_5y=growth_5y,
+                        rev_growth_y1=rev_growth_y1, rev_growth_y2=rev_growth_y2,
+                        eps_growth_y1=eps_growth_y1, eps_growth_y2=eps_growth_y2,
                         # actual historical dollar figures, for the income statement display -
                         # everything above this point only stores ratios/percentages
                         cogs_last=(cogs_last / 1e6) if cogs_last else None,
@@ -272,6 +360,15 @@ if calculate and ticker_input:
                         da_last=(da_last / 1e6) if da_last else None,
                         last_fiscal_year=str(last_col)[:4],
                     )
+
+                    # Valuation history - fetched once here and stored as a
+                    # ready DataFrame, rather than re-fetching on every rerun
+                    try:
+                        balance_sheet = t.balance_sheet
+                    except Exception:
+                        balance_sheet = None
+                    val_hist_df = fetch_valuation_history(t, income_stmt, balance_sheet)
+                    st.session_state.results["val_hist_df"] = val_hist_df
         except Exception as e:
             st.error(f"Something went wrong fetching data for '{ticker_input}': {e}")
             st.session_state.results = None
@@ -314,7 +411,7 @@ if st.session_state.results:
 
     st.caption(
         f"Beta source: Yahoo Finance live data (yours to override above). "
-        f"Year-1 growth source: **{r['y1_source']}** ({r['growth_y1']:.1%}). "
+        f"Year-1 revenue growth source: **{r['y1_source']}** ({r['growth_y1']:.1%}). "
         f"WACC source: **{wacc_source}** ({wacc:.2%})."
     )
 
@@ -322,11 +419,11 @@ if st.session_state.results:
     for i in range(5):
         if i == 0:
             growth_path.append(r["growth_y1"])
-        elif i == 1 and r["growth_y2"] is not None:
-            growth_path.append(r["growth_y2"])
+        elif i == 1 and r["rev_growth_y2"] is not None:
+            growth_path.append(r["rev_growth_y2"])
         else:
             # linear taper toward terminal growth - same approach as the Excel template
-            anchor = r["growth_y2"] if r["growth_y2"] is not None else r["growth_y1"]
+            anchor = r["rev_growth_y2"] if r["rev_growth_y2"] is not None else r["growth_y1"]
             step = (terminal_growth - anchor) / (5 - 1)
             growth_path.append(anchor + step * i)
 
@@ -348,60 +445,25 @@ if st.session_state.results:
     st.metric("WACC used", f"{wacc:.2%}", wacc_source)
 
     # ------------------------------------------------------------------
-    # Income statement - historical last year + 5-year projection, matching
-    # the Excel template's Financial Model tab. Reuses the exact same
-    # projection math as the DCF calculation above (project_income_statement
-    # is the detailed-line-item sibling of project_fcf) so this is guaranteed
-    # to be internally consistent with the actual DCF number, not a separate
-    # display-only calculation that could drift out of sync.
+    # Consensus growth - lightweight, just the 4 numbers, not a full
+    # projected income statement table. The DCF calculation above still
+    # uses the full 5-year projection internally (via project_fcf) - this
+    # section just shows what's actually available from analysts, plainly.
     # ------------------------------------------------------------------
-    st.subheader("Income statement")
-    st.caption(f"Historical (FY{r['last_fiscal_year']}) actuals, then 5 years projected. "
-               f"Cost ratios (COGS, SG&A, R&D, D&A, capex, working capital) are held flat "
-               f"at the historical year's percentage of revenue - the same simplified "
-               f"approach as the free downloadable Excel template's default.")
+    st.subheader("Consensus estimates")
 
-    proj_rows = project_income_statement(
-        r["revenue_last"], r["ebit_margin"], r["cogs_pct"], r["sga_pct"], r["rd_pct"],
-        r["da_pct"], r["capex_pct"], r["nwc_pct"], r["tax_rate"], growth_path
-    )
+    def fmt_pct_or_na(v):
+        return f"{v:+.1%}" if v is not None else "N/A"
 
-    hist_ebitda = r["ebit_last"] + (r["da_last"] or 0)
-    hist_tax = r["ebit_last"] * r["tax_rate"]
-    hist_nopat = r["ebit_last"] - hist_tax
-
-    columns = [f"FY{r['last_fiscal_year']}"] + [f"Year {i+1}" for i in range(5)]
-    line_items = {
-        "Revenue ($mm)": [r["revenue_last"]] + [p["revenue"] for p in proj_rows],
-        "Revenue growth %": [None] + [p["growth"] for p in proj_rows],
-        "COGS ($mm)": [r["cogs_last"]] + [p["cogs"] for p in proj_rows],
-        "SG&A ($mm)": [r["sga_last"]] + [p["sga"] for p in proj_rows],
-        "R&D ($mm)": [r["rd_last"]] + [p["rd"] for p in proj_rows],
-        "EBITDA ($mm)": [hist_ebitda] + [p["ebitda"] for p in proj_rows],
-        "D&A ($mm)": [r["da_last"]] + [p["da"] for p in proj_rows],
-        "EBIT ($mm)": [r["ebit_last"]] + [p["ebit"] for p in proj_rows],
-        "Tax ($mm)": [hist_tax] + [p["tax"] for p in proj_rows],
-        "NOPAT ($mm)": [hist_nopat] + [p["nopat"] for p in proj_rows],
-        "Capex ($mm)": [None] + [p["capex"] for p in proj_rows],
-        "Change in NWC ($mm)": [None] + [p["nwc_change"] for p in proj_rows],
-        "Unlevered FCF ($mm)": [None] + [p["fcf"] for p in proj_rows],
-    }
-    income_df = pd.DataFrame(line_items, index=columns).T
-
-    def fmt_income_cell(row_label):
-        def _fmt(v):
-            if v is None:
-                return "n/a"
-            if "growth" in row_label.lower() or "%" in row_label:
-                return f"{v:.1%}"
-            return f"${v:,.0f}"
-        return _fmt
-
-    styled = income_df.style
-    for row_label in income_df.index:
-        styled = styled.format(fmt_income_cell(row_label), subset=pd.IndexSlice[[row_label], :])
-
-    st.dataframe(styled, width="stretch")
+    g1, g2 = st.columns(2)
+    with g1:
+        st.markdown("**Consensus Revenue Growth**")
+        st.write(f"Year 1: {fmt_pct_or_na(r['rev_growth_y1'])}")
+        st.write(f"Year 2: {fmt_pct_or_na(r['rev_growth_y2'])}")
+    with g2:
+        st.markdown("**Consensus EPS Growth**")
+        st.write(f"Year 1: {fmt_pct_or_na(r['eps_growth_y1'])}")
+        st.write(f"Year 2: {fmt_pct_or_na(r['eps_growth_y2'])}")
 
     # ------------------------------------------------------------------
     # Sensitivity grid - 10x10, matching the Excel template's convention.
@@ -487,9 +549,66 @@ if st.session_state.results:
         "This is a simplified illustrative calculation - cost ratios (COGS, SG&A, R&D, "
         "capex, working capital) are estimated from the latest reported year and held "
         "flat, same as the free downloadable Excel template's default behavior. "
-        "The full template additionally supports peer comparison, 5-year valuation "
-        "history, and persistent manual overrides."
+        "The full template additionally supports peer comparison and persistent "
+        "manual overrides."
     )
+
+    # ------------------------------------------------------------------
+    # Valuation history - same approach as the Excel template's Valuation
+    # History tab: daily P/E (and P/S, P/B) against the stock's own past,
+    # with mean/+1SD/-1SD stats and a chart showing where today sits.
+    # ------------------------------------------------------------------
+    st.subheader("Valuation history")
+    val_hist_df = r.get("val_hist_df")
+
+    if val_hist_df is None or val_hist_df.empty:
+        st.caption("Not enough historical data available for this ticker to build a "
+                   "valuation history.")
+    else:
+        stats = {}
+        for metric in ["pe", "ps", "pb"]:
+            series = val_hist_df[metric].dropna()
+            if len(series) > 1:
+                mean = series.mean()
+                sd = series.std()
+                stats[metric] = dict(mean=mean, sd=sd, plus1=mean + sd, minus1=mean - sd)
+            else:
+                stats[metric] = dict(mean=None, sd=None, plus1=None, minus1=None)
+
+        def fmt_x(v):
+            return f"{v:.1f}x" if v is not None else "N/A"
+
+        stats_df = pd.DataFrame({
+            "P/E": [fmt_x(stats["pe"]["mean"]), fmt_x(stats["pe"]["sd"]),
+                    fmt_x(stats["pe"]["plus1"]), fmt_x(stats["pe"]["minus1"])],
+            "P/S": [fmt_x(stats["ps"]["mean"]), fmt_x(stats["ps"]["sd"]),
+                    fmt_x(stats["ps"]["plus1"]), fmt_x(stats["ps"]["minus1"])],
+            "P/B": [fmt_x(stats["pb"]["mean"]), fmt_x(stats["pb"]["sd"]),
+                    fmt_x(stats["pb"]["plus1"]), fmt_x(stats["pb"]["minus1"])],
+        }, index=["Mean", "Std Dev", "+1 SD", "-1 SD"])
+
+        st.dataframe(stats_df, width="stretch")
+
+        pe_chart_df = val_hist_df[["date", "pe"]].dropna()
+        if not pe_chart_df.empty and stats["pe"]["mean"] is not None:
+            import altair as alt
+
+            base = alt.Chart(pe_chart_df).mark_line(color="#1F3864").encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("pe:Q", title="P/E"),
+            )
+            mean_line = alt.Chart(pd.DataFrame({"y": [stats["pe"]["mean"]]})).mark_rule(
+                color="#5B5F6B", strokeDash=[4, 4]
+            ).encode(y="y:Q")
+            plus1_line = alt.Chart(pd.DataFrame({"y": [stats["pe"]["plus1"]]})).mark_rule(
+                color="#2D6A4F", strokeDash=[2, 2]
+            ).encode(y="y:Q")
+            minus1_line = alt.Chart(pd.DataFrame({"y": [stats["pe"]["minus1"]]})).mark_rule(
+                color="#A13D3D", strokeDash=[2, 2]
+            ).encode(y="y:Q")
+
+            st.altair_chart(base + mean_line + plus1_line + minus1_line, width="stretch")
+            st.caption("Grey dashed = mean. Green dashed = +1 SD. Red dashed = -1 SD.")
 
 st.divider()
 st.caption(
@@ -497,5 +616,4 @@ st.caption(
     "Want the full version with peer comparison and valuation history? "
     "[Download the free Excel template](https://youtube.com/@stock_with_claude)."
 )
-
 
