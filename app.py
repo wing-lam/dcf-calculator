@@ -155,7 +155,7 @@ with col_a:
     ticker_input = st.text_input("Ticker", value="NVDA", label_visibility="collapsed",
                                   placeholder="Enter a ticker, e.g. NVDA").upper().strip()
 with col_b:
-    calculate = st.button("Calculate", use_container_width=True)
+    calculate = st.button("Calculate", width="stretch")
 
 if "results" not in st.session_state:
     st.session_state.results = None
@@ -321,9 +321,28 @@ if st.session_state.results:
     def fmt_cell(v):
         return f"${v:,.0f}" if v is not None else "n/a"
 
+    def color_scale(val, vmin, vmax):
+        """Lightweight red-to-green color scale, self-contained (no matplotlib
+        dependency) - a prior version used pandas' background_gradient(), which
+        needs matplotlib as an optional dependency that wasn't in
+        requirements.txt and broke the deployed app. This avoids that whole
+        class of missing-dependency risk."""
+        if val is None or vmax == vmin:
+            return ""
+        frac = max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
+        # red (low) -> yellow (mid) -> green (high)
+        if frac < 0.5:
+            r, g, b = 235, int(120 + frac * 2 * 110), 120
+        else:
+            r, g, b = int(235 - (frac - 0.5) * 2 * 115), 220, 120
+        return f"background-color: rgb({r},{g},{b}); color: #1A1F2E; font-weight: 500;"
+
+    flat_vals = [v for row in grid for v in row if v is not None]
+    vmin, vmax = (min(flat_vals), max(flat_vals)) if flat_vals else (0, 1)
+
     st.dataframe(
-        grid_df.style.format(fmt_cell).background_gradient(cmap="RdYlGn", axis=None),
-        use_container_width=True,
+        grid_df.style.format(fmt_cell).map(lambda v: color_scale(v, vmin, vmax)),
+        width="stretch",
     )
 
     st.caption(
@@ -340,3 +359,4 @@ st.caption(
     "Want the full version with peer comparison and valuation history? "
     "[Download the free Excel template](https://youtube.com/@stock_with_claude)."
 )
+
