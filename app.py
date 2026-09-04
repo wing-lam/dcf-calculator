@@ -39,12 +39,6 @@ st.markdown("""
         border-radius: 4px; border: none; padding: 0.5rem 1.5rem;
     }
     .stButton>button:hover { background-color: #14213D; color: white; }
-    div[data-testid="stMetric"] {
-        background-color: #FFFFFF; border: 1px solid #D8D4CA;
-        padding: 1rem; border-radius: 4px;
-    }
-    div[data-testid="stMetricLabel"] { color: #5B5F6B !important; }
-    div[data-testid="stMetricValue"] { color: #1F3864 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -136,6 +130,20 @@ def fetch_revenue_growth_estimates(ticker_obj):
         if "+1y" in analysis.index:
             growth_y2 = safe_float(analysis.loc["+1y"].get("growth"))
     return growth_y1, growth_y2
+
+
+def fetch_forward_revenue(ticker_obj):
+    """Consensus current-fiscal-year revenue estimate ('0y' avg) from the
+    same t.revenue_estimate table - used to compute a genuine forward P/S,
+    the same way Yahoo's own forwardPE uses a forward EPS estimate."""
+    try:
+        analysis = ticker_obj.revenue_estimate
+    except Exception:
+        return None
+    if analysis is not None and not analysis.empty and "avg" in analysis.columns:
+        if "0y" in analysis.index:
+            return safe_float(analysis.loc["0y"].get("avg"))
+    return None
 
 
 def project_fcf(revenue_last, ebit_margin, da_pct, capex_pct, nwc_pct, tax_rate, growth_path):
@@ -300,6 +308,8 @@ if calculate and ticker_input:
             target_price = safe_float(info.get("targetMeanPrice"))
             n_analysts = info.get("numberOfAnalystOpinions")
             forward_pe = safe_float(info.get("forwardPE"))
+            forward_revenue = fetch_forward_revenue(t)
+            forward_ps = (price * shares / forward_revenue) if (forward_revenue and shares) else None
             company_name = info.get("longName") or info.get("shortName") or ticker_input
 
             if price is None or shares is None:
@@ -347,6 +357,7 @@ if calculate and ticker_input:
                         ticker=ticker_input, company_name=company_name, price=price,
                         shares=shares / 1e6, debt=debt / 1e6, cash=cash / 1e6, beta=beta,
                         target_price=target_price, n_analysts=n_analysts, forward_pe=forward_pe,
+                        forward_ps=forward_ps,
                         revenue_last=revenue_last / 1e6, cogs_pct=cogs_pct, sga_pct=sga_pct,
                         rd_pct=rd_pct, da_pct=da_pct, capex_pct=capex_pct, nwc_pct=nwc_pct,
                         tax_rate=tax_rate, ebit_margin=ebit_margin, growth_y1=y1, y1_source=y1_source,
@@ -432,18 +443,41 @@ if st.session_state.results:
                             r["nwc_pct"], r["tax_rate"], growth_path)
     implied_price = dcf_implied_price(fcf_list, wacc, terminal_growth, net_debt, r["shares"])
 
+    def metric_card(label, value, delta=None, delta_color="#2D6A4F"):
+        """Fully custom metric card, built as raw HTML with hardcoded colors -
+        no dependency on Streamlit's internal st.metric() DOM structure or
+        class names, which can vary between Streamlit versions and has
+        broken twice already relying on CSS targeting those internals."""
+        delta_html = (
+            f'<div style="color:{delta_color}; font-size:14px; margin-top:4px;">{delta}</div>'
+            if delta else ""
+        )
+        st.markdown(f"""
+        <div style="background:#FFFFFF; border:1px solid #D8D4CA; border-radius:4px;
+                    padding:1rem; height:100%;">
+            <div style="color:#5B5F6B; font-size:14px; margin-bottom:4px;">{label}</div>
+            <div style="color:#1F3864; font-size:28px; font-weight:600;">{value}</div>
+            {delta_html}
+        </div>
+        """, unsafe_allow_html=True)
+
     st.subheader("Result")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("DCF Implied Price", f"${implied_price:,.2f}" if implied_price else "n/a")
-    m2.metric("Current Price", f"${r['price']:,.2f}")
-    if implied_price:
-        upside = (implied_price - r["price"]) / r["price"]
-        m3.metric("vs. Current", f"{upside:+.1%}")
-    if r["target_price"]:
-        m4.metric("Analyst Target", f"${r['target_price']:,.2f}",
-                   f"{r['n_analysts']} analysts" if r["n_analysts"] else None)
+    with m1:
+        metric_card("DCF Implied Price", f"${implied_price:,.2f}" if implied_price else "n/a")
+    with m2:
+        metric_card("Current Price", f"${r['price']:,.2f}")
+    with m3:
+        if implied_price:
+            upside = (implied_price - r["price"]) / r["price"]
+            metric_card("vs. Current", f"{upside:+.1%}")
+    with m4:
+        if r["target_price"]:
+            metric_card("Analyst Target", f"${r['target_price']:,.2f}",
+                        f"{r['n_analysts']} analysts" if r["n_analysts"] else None)
 
-    st.metric("WACC used", f"{wacc:.2%}", wacc_source)
+    st.write("")  # small spacer
+    metric_card("WACC used", f"{wacc:.2%}", wacc_source)
 
     # ------------------------------------------------------------------
     # Consensus growth - lightweight, just the 4 numbers, not a full
@@ -581,19 +615,29 @@ if st.session_state.results:
         def fmt_x(v):
             return f"{v:.1f}x" if v is not None else "N/A"
 
+        # P/E and P/S "current" rows show forward consensus estimates -
+        # P/B stays trailing, since there's no standard "forward book value"
+        # concept the way there's a forward earnings or revenue estimate.
+        pe_current_display = fmt_x(r.get("forward_pe"))
+        ps_current_display = fmt_x(r.get("forward_ps")) if r.get("forward_ps") is not None \
+            else fmt_x(stats["ps"]["current"])
+
         stats_df = pd.DataFrame({
             "P/E": [fmt_x(stats["pe"]["mean"]), fmt_x(stats["pe"]["sd"]),
                     fmt_x(stats["pe"]["plus1"]), fmt_x(stats["pe"]["minus1"]),
-                    fmt_x(stats["pe"]["current"])],
+                    pe_current_display],
             "P/S": [fmt_x(stats["ps"]["mean"]), fmt_x(stats["ps"]["sd"]),
                     fmt_x(stats["ps"]["plus1"]), fmt_x(stats["ps"]["minus1"]),
-                    fmt_x(stats["ps"]["current"])],
+                    ps_current_display],
             "P/B": [fmt_x(stats["pb"]["mean"]), fmt_x(stats["pb"]["sd"]),
                     fmt_x(stats["pb"]["plus1"]), fmt_x(stats["pb"]["minus1"]),
                     fmt_x(stats["pb"]["current"])],
-        }, index=["Mean", "Std Dev", "+1 SD", "-1 SD", "Current"])
+        }, index=["Mean", "Std Dev", "+1 SD", "-1 SD", "Current (Forward)"])
 
         st.dataframe(stats_df, width="stretch")
+        st.caption("Current (Forward) shows the forward consensus estimate for P/E and "
+                   "P/S. P/B stays trailing - there's no standard forward book value "
+                   "concept the way there's a forward earnings or revenue estimate.")
 
         metric_choice = st.selectbox("Chart metric", ["P/E", "P/S", "P/B"])
         metric_key = {"P/E": "pe", "P/S": "ps", "P/B": "pb"}[metric_choice]
@@ -628,23 +672,26 @@ if st.session_state.results:
             layers = base + mean_line + plus1_line + minus1_line
             caption = "Grey dashed = mean. Green dashed = +1 SD. Red dashed = -1 SD."
 
-            # Forward P/E marker - a red dot at today's date, matching the
-            # Excel template's chart. Only meaningful for P/E specifically:
-            # "forward P/S" and "forward P/B" aren't standard concepts the
-            # way forward P/E is (there's no equivalent forward revenue-
-            # per-share or book-value-per-share figure fetched here), so
-            # - same as the Excel tool - this marker only appears on the
-            # P/E view, not P/S or P/B.
+            # Forward marker - a red dot at today's date, matching the Excel
+            # template's chart. Available for P/E and P/S (both have a
+            # genuine forward consensus estimate fetched); not for P/B,
+            # since there's no standard forward book-value concept.
+            forward_value = None
             if metric_key == "pe" and r.get("forward_pe") is not None:
+                forward_value = r["forward_pe"]
+            elif metric_key == "ps" and r.get("forward_ps") is not None:
+                forward_value = r["forward_ps"]
+
+            if forward_value is not None:
                 marker_df = pd.DataFrame({
                     "date": [chart_df["date"].max()],
-                    "pe": [r["forward_pe"]],
+                    metric_key: [forward_value],
                 })
                 marker = alt.Chart(marker_df).mark_point(
                     color="#CC0000", size=120, filled=True
-                ).encode(x="date:T", y="pe:Q")
+                ).encode(x="date:T", y=f"{metric_key}:Q")
                 layers = layers + marker
-                caption += f" Red dot = forward P/E ({r['forward_pe']:.1f}x)."
+                caption += f" 🔴 = forward {metric_choice} ({forward_value:.1f}x)."
 
             st.altair_chart(layers, width="stretch")
             st.caption(caption)
