@@ -1,4 +1,4 @@
-"""
+"
 app.py - Stock with Claude: Live DCF Valuation Calculator (V1)
 ----------------------------------------------------------------
 (c) 2026 Stock with Claude. Free for personal use - not for resale or
@@ -43,6 +43,8 @@ st.markdown("""
         background-color: #FFFFFF; border: 1px solid #D8D4CA;
         padding: 1rem; border-radius: 4px;
     }
+    div[data-testid="stMetricLabel"] { color: #5B5F6B !important; }
+    div[data-testid="stMetricValue"] { color: #1F3864 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -393,5 +395,4 @@ st.caption(
     "© 2026 Stock with Claude. This is not financial advice. "
     "Want the full version with peer comparison and valuation history? "
     "[Download the free Excel template](https://youtube.com/@stock_with_claude)."
-)
 
