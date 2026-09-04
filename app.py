@@ -395,4 +395,5 @@ st.caption(
     "© 2026 Stock with Claude. This is not financial advice. "
     "Want the full version with peer comparison and valuation history? "
     "[Download the free Excel template](https://youtube.com/@stock_with_claude)."
+)
 
