@@ -115,25 +115,58 @@ def fetch_growth_estimates(ticker_obj):
     return growth_y1, growth_y2, growth_5y
 
 
-def project_fcf(revenue_last, cogs_pct, sga_pct, rd_pct, da_pct, capex_pct, nwc_pct,
-                 tax_rate, growth_path):
-    """5-year FCF projection, holding margins flat at last-actual levels -
-    same approach as the Financial Model tab: only revenue growth is
-    analyst/math-driven, cost ratios are held flat and are the user's to
-    override with their own judgment."""
+def project_fcf(revenue_last, ebit_margin, da_pct, capex_pct, nwc_pct, tax_rate, growth_path):
+    """5-year FCF projection. EBIT margin is held flat at the REAL historical
+    margin (ebit_last / revenue_last, where ebit_last is pulled directly from
+    Yahoo's reported EBIT, not reconstructed from cost-statement lines) -
+    this avoids the exact bug we caught building the Excel template: a
+    bottom-up EBIT reconstruction from only COGS/SG&A/R&D/D&A doesn't
+    capture every real cost a company has, so it silently diverges from the
+    correctly-sourced actual EBIT margin, creating a jump in Year 1 that
+    doesn't correspond to any real assumption changing."""
     fcf_list = []
     revenue = revenue_last
     for g in growth_path:
         revenue = revenue * (1 + g)
-        gross_profit = revenue * (1 - cogs_pct)
-        ebit = revenue - (revenue * cogs_pct) - (revenue * sga_pct) - (revenue * rd_pct) - (revenue * da_pct)
-        nopat = ebit * (1 - tax_rate)
+        ebit = revenue * ebit_margin
         da = revenue * da_pct
+        tax = ebit * tax_rate
+        nopat = ebit - tax
         capex = revenue * capex_pct
         nwc_change = revenue * nwc_pct
         fcf = nopat + da - capex - nwc_change
         fcf_list.append(fcf)
     return fcf_list
+
+
+def project_income_statement(revenue_last, ebit_margin, cogs_pct, sga_pct, rd_pct, da_pct,
+                              capex_pct, nwc_pct, tax_rate, growth_path):
+    """Same corrected approach as project_fcf: EBIT margin is held flat at
+    the real historical margin, not reconstructed from cost-statement lines.
+    COGS/SG&A/R&D are still shown for context (scaled at their own
+    historical percentage of revenue), but they're informational only here -
+    they don't drive EBIT, matching how the Excel template's EBIT line is
+    also sourced directly rather than derived from these three."""
+    rows = []
+    revenue = revenue_last
+    for g in growth_path:
+        revenue = revenue * (1 + g)
+        cogs = revenue * cogs_pct
+        gross_profit = revenue - cogs
+        sga = revenue * sga_pct
+        rd = revenue * rd_pct
+        da = revenue * da_pct
+        ebit = revenue * ebit_margin
+        ebitda = ebit + da
+        tax = ebit * tax_rate
+        nopat = ebit - tax
+        capex = revenue * capex_pct
+        nwc_change = revenue * nwc_pct
+        fcf = nopat + da - capex - nwc_change
+        rows.append(dict(revenue=revenue, growth=g, cogs=cogs, gross_profit=gross_profit,
+                          sga=sga, rd=rd, ebitda=ebitda, da=da, ebit=ebit, tax=tax,
+                          nopat=nopat, capex=capex, nwc_change=nwc_change, fcf=fcf))
+    return rows
 
 
 def dcf_implied_price(fcf_list, wacc, terminal_growth, net_debt, shares):
@@ -211,6 +244,10 @@ if calculate and ticker_input:
                     capex_pct = 0.03   # not directly available from .income_stmt; reasonable default
                     nwc_pct = 0.02
                     tax_rate = 0.21    # US statutory default; adjustable below
+                    # EBIT margin anchored to the correctly-sourced actual EBIT (pulled
+                    # directly, not reconstructed from COGS/SG&A/R&D/D&A) - see the
+                    # docstring on project_fcf for why this matters.
+                    ebit_margin = ebit_last / revenue_last
 
                     growth_y1, growth_y2, growth_5y = fetch_growth_estimates(t)
                     rev_growth_trailing = safe_float(info.get("revenueGrowth"))
@@ -224,8 +261,16 @@ if calculate and ticker_input:
                         target_price=target_price, n_analysts=n_analysts,
                         revenue_last=revenue_last / 1e6, cogs_pct=cogs_pct, sga_pct=sga_pct,
                         rd_pct=rd_pct, da_pct=da_pct, capex_pct=capex_pct, nwc_pct=nwc_pct,
-                        tax_rate=tax_rate, growth_y1=y1, y1_source=y1_source,
+                        tax_rate=tax_rate, ebit_margin=ebit_margin, growth_y1=y1, y1_source=y1_source,
                         growth_y2=growth_y2, growth_5y=growth_5y,
+                        # actual historical dollar figures, for the income statement display -
+                        # everything above this point only stores ratios/percentages
+                        cogs_last=(cogs_last / 1e6) if cogs_last else None,
+                        sga_last=(sga_last / 1e6) if sga_last else None,
+                        rd_last=(rd_last / 1e6) if rd_last else None,
+                        ebit_last=ebit_last / 1e6,
+                        da_last=(da_last / 1e6) if da_last else None,
+                        last_fiscal_year=str(last_col)[:4],
                     )
         except Exception as e:
             st.error(f"Something went wrong fetching data for '{ticker_input}': {e}")
@@ -285,8 +330,8 @@ if st.session_state.results:
             step = (terminal_growth - anchor) / (5 - 1)
             growth_path.append(anchor + step * i)
 
-    fcf_list = project_fcf(r["revenue_last"], r["cogs_pct"], r["sga_pct"], r["rd_pct"],
-                            r["da_pct"], r["capex_pct"], r["nwc_pct"], r["tax_rate"], growth_path)
+    fcf_list = project_fcf(r["revenue_last"], r["ebit_margin"], r["da_pct"], r["capex_pct"],
+                            r["nwc_pct"], r["tax_rate"], growth_path)
     implied_price = dcf_implied_price(fcf_list, wacc, terminal_growth, net_debt, r["shares"])
 
     st.subheader("Result")
@@ -301,6 +346,62 @@ if st.session_state.results:
                    f"{r['n_analysts']} analysts" if r["n_analysts"] else None)
 
     st.metric("WACC used", f"{wacc:.2%}", wacc_source)
+
+    # ------------------------------------------------------------------
+    # Income statement - historical last year + 5-year projection, matching
+    # the Excel template's Financial Model tab. Reuses the exact same
+    # projection math as the DCF calculation above (project_income_statement
+    # is the detailed-line-item sibling of project_fcf) so this is guaranteed
+    # to be internally consistent with the actual DCF number, not a separate
+    # display-only calculation that could drift out of sync.
+    # ------------------------------------------------------------------
+    st.subheader("Income statement")
+    st.caption(f"Historical (FY{r['last_fiscal_year']}) actuals, then 5 years projected. "
+               f"Cost ratios (COGS, SG&A, R&D, D&A, capex, working capital) are held flat "
+               f"at the historical year's percentage of revenue - the same simplified "
+               f"approach as the free downloadable Excel template's default.")
+
+    proj_rows = project_income_statement(
+        r["revenue_last"], r["ebit_margin"], r["cogs_pct"], r["sga_pct"], r["rd_pct"],
+        r["da_pct"], r["capex_pct"], r["nwc_pct"], r["tax_rate"], growth_path
+    )
+
+    hist_ebitda = r["ebit_last"] + (r["da_last"] or 0)
+    hist_tax = r["ebit_last"] * r["tax_rate"]
+    hist_nopat = r["ebit_last"] - hist_tax
+
+    columns = [f"FY{r['last_fiscal_year']}"] + [f"Year {i+1}" for i in range(5)]
+    line_items = {
+        "Revenue ($mm)": [r["revenue_last"]] + [p["revenue"] for p in proj_rows],
+        "Revenue growth %": [None] + [p["growth"] for p in proj_rows],
+        "COGS ($mm)": [r["cogs_last"]] + [p["cogs"] for p in proj_rows],
+        "SG&A ($mm)": [r["sga_last"]] + [p["sga"] for p in proj_rows],
+        "R&D ($mm)": [r["rd_last"]] + [p["rd"] for p in proj_rows],
+        "EBITDA ($mm)": [hist_ebitda] + [p["ebitda"] for p in proj_rows],
+        "D&A ($mm)": [r["da_last"]] + [p["da"] for p in proj_rows],
+        "EBIT ($mm)": [r["ebit_last"]] + [p["ebit"] for p in proj_rows],
+        "Tax ($mm)": [hist_tax] + [p["tax"] for p in proj_rows],
+        "NOPAT ($mm)": [hist_nopat] + [p["nopat"] for p in proj_rows],
+        "Capex ($mm)": [None] + [p["capex"] for p in proj_rows],
+        "Change in NWC ($mm)": [None] + [p["nwc_change"] for p in proj_rows],
+        "Unlevered FCF ($mm)": [None] + [p["fcf"] for p in proj_rows],
+    }
+    income_df = pd.DataFrame(line_items, index=columns).T
+
+    def fmt_income_cell(row_label):
+        def _fmt(v):
+            if v is None:
+                return "n/a"
+            if "growth" in row_label.lower() or "%" in row_label:
+                return f"{v:.1%}"
+            return f"${v:,.0f}"
+        return _fmt
+
+    styled = income_df.style
+    for row_label in income_df.index:
+        styled = styled.format(fmt_income_cell(row_label), subset=pd.IndexSlice[[row_label], :])
+
+    st.dataframe(styled, width="stretch")
 
     # ------------------------------------------------------------------
     # Sensitivity grid - 10x10, matching the Excel template's convention.
@@ -321,8 +422,8 @@ if st.session_state.results:
     for g in growth_steps:
         row = []
         for w in wacc_steps:
-            fcf_g = project_fcf(r["revenue_last"], r["cogs_pct"], r["sga_pct"], r["rd_pct"],
-                                 r["da_pct"], r["capex_pct"], r["nwc_pct"], r["tax_rate"],
+            fcf_g = project_fcf(r["revenue_last"], r["ebit_margin"], r["da_pct"], r["capex_pct"],
+                                 r["nwc_pct"], r["tax_rate"],
                                  growth_path)  # near-term path unaffected by grid axes
             p = dcf_implied_price(fcf_g, w, g, net_debt, r["shares"])
             row.append(p)
@@ -396,4 +497,5 @@ st.caption(
     "Want the full version with peer comparison and valuation history? "
     "[Download the free Excel template](https://youtube.com/@stock_with_claude)."
 )
+
 
