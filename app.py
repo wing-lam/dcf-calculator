@@ -474,20 +474,51 @@ if st.session_state.results:
 
             x_axis = alt.Axis(title="Date", format="%b %Y", labelAngle=-40, tickCount="month")
 
-            # mark_line(point=True) + tooltip encoding: hovering directly over
-            # a data point shows its date and value. A live-browser render
-            # can't be verified from this sandbox, so this uses the simpler,
-            # more robust "point + tooltip" pattern rather than a fancier
-            # nearest-point-anywhere-on-the-line recipe that's harder to
-            # confirm actually works without seeing it rendered.
-            base = alt.Chart(chart_df).mark_line(point=True, color="#1F3864").encode(
+            # Crosshair pattern: a nearest-point selection bound to
+            # pointermove (not the older mouseover-only event) so it
+            # responds the same way to a mouse hover on laptop and a
+            # finger drag on phone. A wide, fully invisible point layer
+            # spans the whole chart so the touch/hover target is generous
+            # rather than requiring pixel-precision on the actual line -
+            # this is what actually fixes responsiveness on a small touch
+            # screen, not just switching event names.
+            nearest = alt.selection_point(
+                nearest=True, on="pointermove", fields=["date"], empty=False
+            )
+
+            base = alt.Chart(chart_df).mark_line(color="#1F3864").encode(
                 x=alt.X("date:T", axis=x_axis),
                 y=alt.Y(f"{metric_key}:Q", title=y_title),
-                tooltip=[alt.Tooltip("date:T", title="Date", format="%b %d, %Y"),
-                         alt.Tooltip(f"{metric_key}:Q", title=y_title, format=",.2f")],
             ).properties(width=CHART_WIDTH, height=CHART_HEIGHT)
 
-            layers = base
+            # Invisible wide hit-target layer - this is what the pointer/finger
+            # actually interacts with, sized generously so a touch nearby
+            # (not pixel-exact) still registers.
+            hit_target = alt.Chart(chart_df).mark_point(size=400, opacity=0).encode(
+                x="date:T",
+            ).add_params(nearest)
+
+            # The vertical crosshair line itself, following the pointer
+            crosshair_rule = base.mark_rule(color="#B8B8B8", strokeWidth=1).encode(
+                opacity=alt.condition(nearest, alt.value(0.8), alt.value(0)),
+            ).transform_filter(nearest)
+
+            # Highlighted dot at the exact point the crosshair is on
+            crosshair_point = base.mark_point(size=80, filled=True, color="#1F3864").encode(
+                opacity=alt.condition(nearest, alt.value(1), alt.value(0)),
+            )
+
+            # Date + value labels that move with the crosshair
+            date_label = base.mark_text(align="left", dx=8, dy=-18, fontSize=12,
+                                         color="#5B5F6B", fontWeight="bold").encode(
+                text=alt.condition(nearest, alt.Text("date:T", format="%b %d, %Y"), alt.value("")),
+            )
+            value_label = base.mark_text(align="left", dx=8, dy=-4, fontSize=13,
+                                          color="#1F3864", fontWeight="bold").encode(
+                text=alt.condition(nearest, alt.Text(f"{metric_key}:Q", format=",.2f"), alt.value("")),
+            )
+
+            layers = base + hit_target + crosshair_rule + crosshair_point + date_label + value_label
             caption = ""
 
             if metric_choice != "Price":
@@ -741,3 +772,4 @@ st.caption(
     "Want the full version with peer comparison and valuation history? "
     "[Download the free Excel template](https://youtube.com/@stock_with_claude)."
 )
+
