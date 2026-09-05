@@ -492,7 +492,7 @@ if st.session_state.results:
             # this is what actually fixes responsiveness on a small touch
             # screen, not just switching event names.
             nearest = alt.selection_point(
-                nearest=True, on="pointermove", fields=["date"], empty=False
+                nearest=True, on="mousemove, touchmove, pointermove", fields=["date"], empty=False
             )
 
             base = alt.Chart(chart_df).mark_line(color="#1F3864").encode(
