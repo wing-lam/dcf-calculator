@@ -44,6 +44,15 @@ st.markdown("""
         border-radius: 4px; border: none; padding: 0.5rem 1.5rem;
     }
     .stButton>button:hover { background-color: #14213D; color: white; }
+
+    /* Fixes touch-drag on the price/valuation chart: without this, mobile
+       browsers compete with the chart's own touch handling to decide
+       whether a drag is "scroll the page" or "interact with the chart",
+       which causes both janky/delayed crosshair tracking and the page
+       shifting under your finger. Targets the actual svg/canvas elements
+       Vega-Lite draws into directly, rather than a Streamlit wrapper class
+       name that could vary by version. */
+    svg, canvas { touch-action: none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -772,4 +781,3 @@ st.caption(
     "Want the full version with peer comparison and valuation history? "
     "[Download the free Excel template](https://youtube.com/@stock_with_claude)."
 )
-
