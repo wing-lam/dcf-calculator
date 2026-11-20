@@ -128,24 +128,87 @@ def fetch_eps_growth_estimates(ticker_obj):
     return growth_y1, growth_y2, growth_5y
 
 
+def _growth_from_table(analysis, year_ago_col):
+    """Consensus growth for this year (0y) and next year (+1y). Uses Yahoo's
+    'growth' column when present; when Yahoo leaves it out (it often does now),
+    works it out from the consensus averages instead:
+      0y growth  = this year's average estimate / last year's actual - 1
+      +1y growth = next year's average estimate / this year's average - 1"""
+    g1 = g2 = None
+    if analysis is None or getattr(analysis, "empty", True):
+        return g1, g2
+    cols = analysis.columns
+    if "growth" in cols:
+        if "0y" in analysis.index:
+            g1 = safe_float(analysis.loc["0y"].get("growth"))
+        if "+1y" in analysis.index:
+            g2 = safe_float(analysis.loc["+1y"].get("growth"))
+    if "avg" in cols:
+        avg0 = safe_float(analysis.loc["0y"].get("avg")) if "0y" in analysis.index else None
+        avg1 = safe_float(analysis.loc["+1y"].get("avg")) if "+1y" in analysis.index else None
+        prev = safe_float(analysis.loc["0y"].get(year_ago_col)) if ("0y" in analysis.index and year_ago_col in cols) else None
+        if g1 is None and avg0 and prev and prev > 0:
+            g1 = avg0 / prev - 1
+        if g2 is None and avg0 and avg1 and avg0 > 0:
+            g2 = avg1 / avg0 - 1
+    return g1, g2
+
+
 def fetch_revenue_growth_estimates(ticker_obj):
-    """Fetches from t.revenue_estimate - Yahoo's actual REVENUE-specific
-    consensus growth table, separate from the EPS-focused one above. This
-    is what should genuinely drive a DCF's revenue projection, since EPS
-    growth and revenue growth aren't the same thing (margin changes, share
-    buybacks etc. mean they can diverge)."""
-    growth_y1 = growth_y2 = None
+    """Consensus REVENUE growth (t.revenue_estimate) - what should drive a
+    DCF's revenue projection."""
     try:
         analysis = ticker_obj.revenue_estimate
     except Exception:
         analysis = None
+    return _growth_from_table(analysis, "yearAgoRevenue")
 
-    if analysis is not None and not analysis.empty and "growth" in analysis.columns:
-        if "0y" in analysis.index:
-            growth_y1 = safe_float(analysis.loc["0y"].get("growth"))
-        if "+1y" in analysis.index:
-            growth_y2 = safe_float(analysis.loc["+1y"].get("growth"))
-    return growth_y1, growth_y2
+
+def fetch_eps_growth_from_estimates(ticker_obj):
+    """Fallback EPS growth from t.earnings_estimate when the growth table is empty."""
+    try:
+        analysis = ticker_obj.earnings_estimate
+    except Exception:
+        analysis = None
+    return _growth_from_table(analysis, "yearAgoEps")
+
+
+def build_growth_path(g1, g2, terminal_growth):
+    """5-year revenue growth: year 1 = g1, year 2 = g2 (if known), then a
+    straight-line fade to terminal growth by year 5."""
+    path = []
+    for i in range(5):
+        if i == 0:
+            path.append(g1)
+        elif i == 1 and g2 is not None:
+            path.append(g2)
+        else:
+            anchor = g2 if g2 is not None else g1
+            step = (terminal_growth - anchor) / (5 - 1)
+            path.append(anchor + step * i)
+    return path
+
+
+def implied_wacc(target, fcf_list, terminal_growth, net_debt, shares):
+    """Reverse DCF: the WACC at which the DCF value equals `target` (e.g. the
+    current price or the analyst consensus target). DCF value falls as WACC
+    rises, so a simple bisection finds it. Returns None if no WACC between
+    terminal growth + 0.25% and 40% gives that value."""
+    if not target or not fcf_list or not shares:
+        return None
+    lo, hi = terminal_growth + 0.0025, 0.40
+    p_lo = dcf_implied_price(fcf_list, lo, terminal_growth, net_debt, shares)
+    p_hi = dcf_implied_price(fcf_list, hi, terminal_growth, net_debt, shares)
+    if p_lo is None or p_hi is None or not (p_hi <= target <= p_lo):
+        return None
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        p = dcf_implied_price(fcf_list, mid, terminal_growth, net_debt, shares)
+        if p > target:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
 
 
 def fetch_forward_revenue(ticker_obj):
@@ -363,6 +426,8 @@ if calculate and ticker_input:
                 # banks and insurers report differently. ---
                 rev_growth_y1, rev_growth_y2 = fetch_revenue_growth_estimates(t)
                 eps_growth_y1, eps_growth_y2, eps_growth_5y = fetch_eps_growth_estimates(t)
+                if eps_growth_y1 is None and eps_growth_y2 is None:
+                    eps_growth_y1, eps_growth_y2 = fetch_eps_growth_from_estimates(t)
 
                 results = dict(
                     ticker=ticker_input, company_name=company_name, price=price,
@@ -630,9 +695,45 @@ if st.session_state.results:
     # ------------------------------------------------------------------
     # 4. Consensus analyst target price (moved out of the DCF Result cards)
     # ------------------------------------------------------------------
-    if r["target_price"]:
+    if r["target_price"] and not r.get("dcf_available"):
         metric_card("Analyst Consensus Target Price", f"${r['target_price']:,.2f}",
                     f"{r['n_analysts']} analysts" if r["n_analysts"] else None)
+
+    # ------------------------------------------------------------------
+    # 5. Consensus starting point: what the analysts' numbers imply, shown
+    # BEFORE the visitor changes any assumption (mirrors the Excel version).
+    # Consensus growth for years 1-2, fading to 2.5% terminal growth, then
+    # walk backwards to the WACC that makes the DCF equal the target price.
+    # ------------------------------------------------------------------
+    if r.get("dcf_available"):
+        st.subheader("What the consensus implies")
+        base_tg = 0.025
+        base_path = build_growth_path(r["growth_y1"], r["rev_growth_y2"], base_tg)
+        base_fcf = project_fcf(r["revenue_last"], r["ebit_margin"], r["da_pct"], r["capex_pct"],
+                               r["nwc_pct"], r["tax_rate"], base_path)
+        base_nd = r["debt"] - r["cash"]
+        wc_tgt = implied_wacc(r.get("target_price"), base_fcf, base_tg, base_nd, r["shares"])
+        wc_mkt = implied_wacc(r["price"], base_fcf, base_tg, base_nd, r["shares"])
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            metric_card("Consensus target", f"${r['target_price']:,.2f}" if r.get("target_price") else "n/a",
+                        f"{(r['target_price'] / r['price'] - 1):+.1%} vs price" if r.get("target_price") else None)
+        with k2:
+            g_txt = f"{r['growth_y1']:+.1%}"
+            if r["rev_growth_y2"] is not None:
+                g_txt += f" / {r['rev_growth_y2']:+.1%}"
+            metric_card("Revenue growth Y1 / Y2", g_txt, r["y1_source"])
+        with k3:
+            metric_card("WACC implied by target", f"{wc_tgt:.2%}" if wc_tgt is not None else "n/a",
+                        "DCF = consensus target")
+        with k4:
+            metric_card("WACC implied by price", f"{wc_mkt:.2%}" if wc_mkt is not None else "n/a",
+                        "DCF = current price")
+        st.caption("Starting point before you change anything: consensus revenue growth for years 1-2, "
+                   "fading to 2.5% terminal growth, with today's margins. The implied WACC is the discount "
+                   "rate at which that forecast is worth exactly the analysts' target (or today's price). "
+                   "If it looks too low for the stock's risk, the target is demanding; if it looks high, "
+                   "the target is conservative. Change the assumptions below to test your own view.")
 
     if r.get("dcf_available"):
         st.divider()
@@ -679,16 +780,7 @@ if st.session_state.results:
             f"WACC source: **{wacc_source}** ({wacc:.2%})."
         )
 
-        growth_path = []
-        for i in range(5):
-            if i == 0:
-                growth_path.append(r["growth_y1"])
-            elif i == 1 and r["rev_growth_y2"] is not None:
-                growth_path.append(r["rev_growth_y2"])
-            else:
-                anchor = r["rev_growth_y2"] if r["rev_growth_y2"] is not None else r["growth_y1"]
-                step = (terminal_growth - anchor) / (5 - 1)
-                growth_path.append(anchor + step * i)
+        growth_path = build_growth_path(r["growth_y1"], r["rev_growth_y2"], terminal_growth)
 
         fcf_list = project_fcf(r["revenue_last"], r["ebit_margin"], r["da_pct"], r["capex_pct"],
                                 r["nwc_pct"], r["tax_rate"], growth_path)
@@ -706,7 +798,24 @@ if st.session_state.results:
                 metric_card("vs. Current", f"{upside:+.1%}")
 
         st.write("")
-        metric_card("WACC used", f"{wacc:.2%}", wacc_source)
+        w_mkt = implied_wacc(r["price"], fcf_list, terminal_growth, net_debt, r["shares"])
+        w_tgt = implied_wacc(r.get("target_price"), fcf_list, terminal_growth, net_debt, r["shares"])
+        w1, w2, w3 = st.columns(3)
+        with w1:
+            metric_card("WACC used", f"{wacc:.2%}", wacc_source)
+        with w2:
+            metric_card("WACC implied by current price",
+                        f"{w_mkt:.2%}" if w_mkt is not None else "n/a",
+                        f"Discount rate at which the DCF equals ${r['price']:,.2f}")
+        with w3:
+            tgt_txt = f"${r['target_price']:,.2f}" if r.get("target_price") else "the target"
+            metric_card("WACC implied by consensus target",
+                        f"{w_tgt:.2%}" if w_tgt is not None else "n/a",
+                        f"Discount rate at which the DCF equals {tgt_txt}")
+        st.caption("Reverse DCF: with the same cash-flow forecast, these are the discount rates the market "
+                   "price and the analysts' average target imply. A lower implied WACC than yours means the "
+                   "price already assumes more than your forecast; a higher one means it assumes less. "
+                   "n/a means no WACC between terminal growth and 40% produces that price.")
 
         # ------------------------------------------------------------------
         # Sensitivity grid - 10x10, matching the Excel template's convention.
