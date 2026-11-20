@@ -314,10 +314,34 @@ if calculate and ticker_input:
     with st.spinner(f"Fetching live data for {ticker_input} ..."):
         try:
             t = yf.Ticker(ticker_input)
-            info = t.info
+            # Yahoo often returns an empty or partial .info to cloud servers
+            # (rate limiting / blocking). Don't let that kill the whole app:
+            # fall back to fast_info and the balance sheet for the essentials.
+            try:
+                info = t.info or {}
+            except Exception:
+                info = {}
 
             price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
             shares = safe_float(info.get("sharesOutstanding"))
+            if price is None or shares is None:
+                try:
+                    fi = t.fast_info
+                    if price is None:
+                        price = safe_float(fi.get("lastPrice") or fi.get("previousClose"))
+                    if shares is None:
+                        shares = safe_float(fi.get("shares"))
+                except Exception:
+                    pass
+            if shares is None:
+                try:
+                    bs = t.balance_sheet
+                    for key in ("Ordinary Shares Number", "Share Issued"):
+                        if key in bs.index:
+                            shares = safe_float(bs.loc[key].dropna().iloc[0])
+                            break
+                except Exception:
+                    pass
             debt = safe_float(info.get("totalDebt")) or 0.0
             cash = safe_float(info.get("totalCash")) or 0.0
             beta = safe_float(info.get("beta")) or 1.0
