@@ -33,6 +33,33 @@ import math
 st.set_page_config(page_title="Live DCF Calculator - Stock with Claude", layout="wide")
 
 # ---------------------------------------------------------------------------
+# Language: English by default; Traditional Chinese with ?lang=zh in the link
+# (the Chinese Stock Tools page embeds that link) or via the switch below.
+# ---------------------------------------------------------------------------
+_qp_lang = str(st.query_params.get("lang", "en")).lower()
+_lang_choice = st.radio("Language / 語言", ["English", "中文"], index=1 if _qp_lang.startswith("zh") else 0,
+                        horizontal=True, label_visibility="collapsed")
+ZH = _lang_choice == "中文"
+if ZH != _qp_lang.startswith("zh"):
+    st.query_params["lang"] = "zh" if ZH else "en"
+
+
+BETA_CAP = 1.8  # starting beta is capped here; Yahoo's figure is shown and users can override
+
+
+def T(en, zh):
+    """Return the Traditional Chinese text when the Chinese version is selected."""
+    return zh if ZH else en
+
+
+SOURCE_ZH = {"Analyst": "分析師共識", "Trailing (proxy)": "過往增長（替代值）",
+             "Your Override": "自行輸入", "Calculated (CAPM)": "按 CAPM 計算"}
+
+
+def src_label(x):
+    return SOURCE_ZH.get(x, x) if ZH else x
+
+# ---------------------------------------------------------------------------
 # Brand styling - matches the Excel template and website (navy / amber)
 # ---------------------------------------------------------------------------
 st.markdown("""
@@ -56,11 +83,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Live DCF Valuation Calculator")
-st.caption(
+st.title(T("Live DCF Valuation Calculator", "即時 DCF 估值計算器"))
+st.caption(T(
     "Type any ticker below. Pulls live data from Yahoo Finance - price and valuation "
-    "history first, a full DCF calculation further down the page. Not investment advice."
-)
+    "history first, a full DCF calculation further down the page. Not investment advice.",
+    "在下方輸入任何股票代號。工具會從 Yahoo Finance 抓取即時數據：先顯示股價及估值歷史，"
+    "頁面下方再做一套完整的現金流折現（DCF）估值。並不構成投資建議。"
+))
 
 
 # ---------------------------------------------------------------------------
@@ -359,16 +388,19 @@ def metric_card(label, value, delta=None, delta_color="#2D6A4F"):
 # ---------------------------------------------------------------------------
 col_a, col_b = st.columns([3, 1])
 with col_a:
-    ticker_input = st.text_input("Ticker", value="NVDA", label_visibility="collapsed",
-                                  placeholder="Enter a ticker, e.g. NVDA").upper().strip()
+    ticker_input = st.text_input(T("Ticker", "股票代號"), value="NVDA", label_visibility="collapsed",
+                                  placeholder=T("Enter a ticker, e.g. NVDA", "輸入股票代號，例如 NVDA")).upper().strip()
 with col_b:
-    calculate = st.button("Calculate", width="stretch")
+    calculate = st.button(T("Calculate", "計算"), width="stretch")
 
-st.caption(
+st.caption(T(
     "🇭🇰 **Hong Kong stocks**: use the full Yahoo Finance format, including the leading "
     "zero and the .HK suffix - e.g. Tencent is **0700.HK**, not 700.HK or 700.  \n"
-    "🏦 No DCF data shown for banks and insurers."
-)
+    "🏦 No DCF data shown for banks and insurers.",
+    "🇭🇰 **港股**：請使用 Yahoo Finance 的完整格式，包括前面的 0 及 .HK 後綴，"
+    "例如騰訊是 **0700.HK**，而不是 700.HK 或 700。  \n"
+    "🏦 銀行及保險公司不提供 DCF 估值。"
+))
 
 if "results" not in st.session_state:
     st.session_state.results = None
@@ -416,8 +448,8 @@ if calculate and ticker_input:
             company_name = info.get("longName") or info.get("shortName") or ticker_input
 
             if price is None or shares is None:
-                st.error(f"Could not find price/shares data for '{ticker_input}'. "
-                          f"Check the ticker is correct.")
+                st.error(T(f"Could not find price/shares data for '{ticker_input}'. ", f"找不到「{ticker_input}」的股價或股數數據。") + T(
+                          "Check the ticker is correct.", "請檢查股票代號是否正確。"))
                 st.session_state.results = None
             else:
                 # --- Core info: chart, 52-week range, consensus estimates,
@@ -493,7 +525,7 @@ if calculate and ticker_input:
 
                 st.session_state.results = results
         except Exception as e:
-            st.error(f"Something went wrong fetching data for '{ticker_input}': {e}")
+            st.error(T(f"Something went wrong fetching data for '{ticker_input}': {e}", f"抓取「{ticker_input}」數據時出錯：{e}"))
             st.session_state.results = None
 
 # ---------------------------------------------------------------------------
@@ -501,18 +533,18 @@ if calculate and ticker_input:
 # ---------------------------------------------------------------------------
 if st.session_state.results:
     r = st.session_state.results
-    st.success(f"Loaded: **{r['company_name']}** ({r['ticker']})")
+    st.success(T(f"Loaded: **{r['company_name']}** ({r['ticker']})", f"已載入：**{r['company_name']}**（{r['ticker']}）"))
 
     val_hist_df = r.get("val_hist_df")
 
     # ------------------------------------------------------------------
     # 1. Price / valuation chart - defaults to Price, 1 Year
     # ------------------------------------------------------------------
-    st.subheader("Ticker Valuation History and Price")
+    st.subheader(T("Ticker Valuation History and Price", "估值歷史及股價"))
 
     if val_hist_df is None or val_hist_df.empty:
-        st.caption("Not enough historical data available for this ticker to build a "
-                   "price or valuation history.")
+        st.caption(T("Not enough historical data available for this ticker to build a "
+                   "price or valuation history.", "這隻股票的歷史數據不足，無法建立股價或估值歷史。"))
     else:
         stats = {}
         for metric in ["pe", "ps", "pb"]:
@@ -543,34 +575,39 @@ if st.session_state.results:
             "P/B": [fmt_x(stats["pb"]["mean"]), fmt_x(stats["pb"]["sd"]),
                     fmt_x(stats["pb"]["plus1"]), fmt_x(stats["pb"]["minus1"]),
                     fmt_x(stats["pb"]["current"])],
-        }, index=["Mean", "Std Dev", "+1 SD", "-1 SD", "Current (Forward)"])
+        }, index=[T("Mean", "平均值"), T("Std Dev", "標準差"), T("+1 SD", "+1 標準差"),
+                   T("-1 SD", "−1 標準差"), T("Current (Forward)", "現時（預測）")])
 
         st.dataframe(stats_df, width="stretch")
-        st.caption("Current (Forward) shows the forward consensus estimate for P/E and "
+        st.caption(T("Current (Forward) shows the forward consensus estimate for P/E and "
                    "P/S. P/B stays trailing - there's no standard forward book value "
-                   "concept the way there's a forward earnings or revenue estimate.")
+                   "concept the way there's a forward earnings or revenue estimate.",
+                   "「現時（預測）」顯示市盈率（P/E）及市銷率（P/S）的預測共識數字。市賬率（P/B）仍採用過往數字，"
+                   "因為賬面值並沒有像盈利或收入那樣的標準預測。"))
 
         CHART_WIDTH, CHART_HEIGHT = 700, 380  # fixed regardless of metric/time-range chosen
 
-        metric_choice = st.selectbox("Chart", ["Price", "P/E", "P/S", "P/B"])
+        metric_choice = st.selectbox(T("Chart", "圖表"), ["Price", "P/E", "P/S", "P/B"],
+                                     format_func=lambda x: T(x, "股價") if x == "Price" else x)
 
         if metric_choice == "Price":
-            range_choice = st.selectbox("Time range", ["5Y", "3Y", "1Y", "3M"], index=2)
+            range_choice = st.selectbox(T("Time range", "時間範圍"), ["5Y", "3Y", "1Y", "3M"], index=2,
+                                        format_func=lambda x: T(x, {"5Y": "5 年", "3Y": "3 年", "1Y": "1 年", "3M": "3 個月"}[x]))
             days_map = {"5Y": 365 * 5, "3Y": 365 * 3, "1Y": 365, "3M": 90}
             cutoff = val_hist_df["date"].max() - pd.Timedelta(days=days_map[range_choice])
             chart_df = val_hist_df[val_hist_df["date"] >= cutoff][["date", "price"]].dropna()
-            metric_key, y_title = "price", "Price ($)"
+            metric_key, y_title = "price", T("Price ($)", "股價")
         else:
             metric_key = {"P/E": "pe", "P/S": "ps", "P/B": "pb"}[metric_choice]
             chart_df = val_hist_df[["date", metric_key]].dropna()
             y_title = metric_choice
 
         if chart_df.empty:
-            st.caption("Not enough data to draw this chart.")
+            st.caption(T("Not enough data to draw this chart.", "數據不足，無法繪製圖表。"))
         else:
             import altair as alt
 
-            x_axis = alt.Axis(title="Date", format="%b %Y", labelAngle=-40, tickCount="month")
+            x_axis = alt.Axis(title=T("Date", "日期"), format="%b %Y", labelAngle=-40, tickCount="month")
 
             # Crosshair pattern: a nearest-point selection bound to
             # pointermove (not the older mouseover-only event) so it
@@ -632,7 +669,8 @@ if st.session_state.results:
                         color="#A13D3D", strokeDash=[2, 2]
                     ).encode(y="y:Q")
                     layers = layers + mean_line + plus1_line + minus1_line
-                    caption = "Grey dashed = mean. Green dashed = +1 SD. Red dashed = -1 SD."
+                    caption = T("Grey dashed = mean. Green dashed = +1 SD. Red dashed = -1 SD.",
+                              "灰色虛線 = 平均值；綠色虛線 = +1 標準差；紅色虛線 = −1 標準差。")
 
                 forward_value = None
                 if metric_key == "pe" and r.get("forward_pe") is not None:
@@ -649,7 +687,8 @@ if st.session_state.results:
                         color="#CC0000", size=120, filled=True
                     ).encode(x="date:T", y=f"{metric_key}:Q")
                     layers = layers + marker
-                    caption += f" 🔴 = forward {metric_choice} ({forward_value:.1f}x)."
+                    caption += T(f" 🔴 = forward {metric_choice} ({forward_value:.1f}x).",
+                                f" 🔴 = 預測 {metric_choice}（{forward_value:.1f} 倍）。")
 
             # width="content" (not "stretch") so the chart keeps the exact
             # fixed size set above no matter which metric/time-range is
@@ -661,43 +700,43 @@ if st.session_state.results:
     # ------------------------------------------------------------------
     # 2. 52-week high / low, with dates
     # ------------------------------------------------------------------
-    st.subheader("52-week range")
+    st.subheader(T("52-week range", "52 週高低位"))
     wk52 = r.get("wk52")
     if wk52 is None:
-        st.caption("Not enough data to compute a 52-week range for this ticker.")
+        st.caption(T("Not enough data to compute a 52-week range for this ticker.", "數據不足，無法計算 52 週高低位。"))
     else:
         w1, w2 = st.columns(2)
         with w1:
-            metric_card("52-Week High", f"${wk52['high']:,.2f}",
+            metric_card(T("52-Week High", "52 週高位"), f"${wk52['high']:,.2f}",
                         wk52["high_date"].strftime("%b %d, %Y"), delta_color="#5B5F6B")
         with w2:
-            metric_card("52-Week Low", f"${wk52['low']:,.2f}",
+            metric_card(T("52-Week Low", "52 週低位"), f"${wk52['low']:,.2f}",
                         wk52["low_date"].strftime("%b %d, %Y"), delta_color="#5B5F6B")
 
     # ------------------------------------------------------------------
     # 3. Consensus growth estimates
     # ------------------------------------------------------------------
-    st.subheader("Consensus estimates")
+    st.subheader(T("Consensus estimates", "分析師共識預測"))
 
     def fmt_pct_or_na(v):
         return f"{v:+.1%}" if v is not None else "N/A"
 
     g1, g2 = st.columns(2)
     with g1:
-        st.markdown("**Consensus Revenue Growth**")
-        st.write(f"Year 1: {fmt_pct_or_na(r['rev_growth_y1'])}")
-        st.write(f"Year 2: {fmt_pct_or_na(r['rev_growth_y2'])}")
+        st.markdown(T("**Consensus Revenue Growth**", "**共識收入增長**"))
+        st.write(T("Year 1", "第一年") + f": {fmt_pct_or_na(r['rev_growth_y1'])}")
+        st.write(T("Year 2", "第二年") + f": {fmt_pct_or_na(r['rev_growth_y2'])}")
     with g2:
-        st.markdown("**Consensus EPS Growth**")
-        st.write(f"Year 1: {fmt_pct_or_na(r['eps_growth_y1'])}")
-        st.write(f"Year 2: {fmt_pct_or_na(r['eps_growth_y2'])}")
+        st.markdown(T("**Consensus EPS Growth**", "**共識每股盈利增長**"))
+        st.write(T("Year 1", "第一年") + f": {fmt_pct_or_na(r['eps_growth_y1'])}")
+        st.write(T("Year 2", "第二年") + f": {fmt_pct_or_na(r['eps_growth_y2'])}")
 
     # ------------------------------------------------------------------
     # 4. Consensus analyst target price (moved out of the DCF Result cards)
     # ------------------------------------------------------------------
     if r["target_price"] and not r.get("dcf_available"):
-        metric_card("Analyst Consensus Target Price", f"${r['target_price']:,.2f}",
-                    f"{r['n_analysts']} analysts" if r["n_analysts"] else None)
+        metric_card(T("Analyst Consensus Target Price", "分析師共識目標價"), f"${r['target_price']:,.2f}",
+                    T(f"{r['n_analysts']} analysts", f"{r['n_analysts']} 位分析師") if r["n_analysts"] else None)
 
     # ------------------------------------------------------------------
     # 5. Consensus starting point: what the analysts' numbers imply, shown
@@ -706,7 +745,7 @@ if st.session_state.results:
     # walk backwards to the WACC that makes the DCF equal the target price.
     # ------------------------------------------------------------------
     if r.get("dcf_available"):
-        st.subheader("What the consensus implies")
+        st.subheader(T("What the consensus implies", "共識預測隱含甚麼"))
         base_tg = 0.025
         base_path = build_growth_path(r["growth_y1"], r["rev_growth_y2"], base_tg)
         base_fcf = project_fcf(r["revenue_last"], r["ebit_margin"], r["da_pct"], r["capex_pct"],
@@ -716,24 +755,27 @@ if st.session_state.results:
         wc_mkt = implied_wacc(r["price"], base_fcf, base_tg, base_nd, r["shares"])
         k1, k2, k3, k4 = st.columns(4)
         with k1:
-            metric_card("Consensus target", f"${r['target_price']:,.2f}" if r.get("target_price") else "n/a",
-                        f"{(r['target_price'] / r['price'] - 1):+.1%} vs price" if r.get("target_price") else None)
+            metric_card(T("Consensus target", "共識目標價"), f"${r['target_price']:,.2f}" if r.get("target_price") else "n/a",
+                        T(f"{(r['target_price'] / r['price'] - 1):+.1%} vs price", f"較現價 {(r['target_price'] / r['price'] - 1):+.1%}") if r.get("target_price") else None)
         with k2:
             g_txt = f"{r['growth_y1']:+.1%}"
             if r["rev_growth_y2"] is not None:
                 g_txt += f" / {r['rev_growth_y2']:+.1%}"
-            metric_card("Revenue growth Y1 / Y2", g_txt, r["y1_source"])
+            metric_card(T("Revenue growth Y1 / Y2", "收入增長 第一年／第二年"), g_txt, src_label(r["y1_source"]))
         with k3:
-            metric_card("WACC implied by target", f"{wc_tgt:.2%}" if wc_tgt is not None else "n/a",
-                        "DCF = consensus target")
+            metric_card(T("WACC implied by target", "目標價隱含的 WACC"), f"{wc_tgt:.2%}" if wc_tgt is not None else "n/a",
+                        T("DCF = consensus target", "DCF = 共識目標價"))
         with k4:
-            metric_card("WACC implied by price", f"{wc_mkt:.2%}" if wc_mkt is not None else "n/a",
-                        "DCF = current price")
-        st.caption("Starting point before you change anything: consensus revenue growth for years 1-2, "
+            metric_card(T("WACC implied by price", "現價隱含的 WACC"), f"{wc_mkt:.2%}" if wc_mkt is not None else "n/a",
+                        T("DCF = current price", "DCF = 現價"))
+        st.caption(T("Starting point before you change anything: consensus revenue growth for years 1-2, "
                    "fading to 2.5% terminal growth, with today's margins. The implied WACC is the discount "
                    "rate at which that forecast is worth exactly the analysts' target (or today's price). "
                    "If it looks too low for the stock's risk, the target is demanding; if it looks high, "
-                   "the target is conservative. Change the assumptions below to test your own view.")
+                   "the target is conservative. Change the assumptions below to test your own view.",
+                   "這是你修改任何假設前的起點：第一及第二年採用共識收入增長，之後逐步降至 2.5% 永續增長率，利潤率維持現有水平。"
+                   "隱含 WACC 是令這個預測剛好等於分析師目標價（或現價）的折現率。如果它相對這隻股票的風險顯得太低，"
+                   "目標價就偏進取；如果顯得偏高，目標價就偏保守。你可以在下方修改假設，測試自己的看法。"))
 
     if r.get("dcf_available"):
         st.divider()
@@ -743,21 +785,23 @@ if st.session_state.results:
         # last, since most visitors want the information above rather than
         # to build their own valuation.
         # ==================================================================
-        st.header("DCF calculator")
+        st.header(T("DCF calculator", "DCF 計算器"))
 
-        st.subheader("Assumptions")
-        st.caption("Beta and terminal growth are already yours to adjust below. "
-                   "WACC is calculated from them by default, or override it directly.")
+        st.subheader(T("Assumptions", "假設"))
+        st.caption(T("Beta and terminal growth are already yours to adjust below. "
+                   "WACC is calculated from them by default, or override it directly.",
+                   "Beta 係數及永續增長率可在下方自行調整。WACC 預設由它們計算，你也可以直接輸入。"))
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            rf = st.number_input("Risk-free rate", value=4.0, step=0.1, format="%.1f") / 100
+            rf = st.number_input(T("Risk-free rate (%)", "無風險利率（%）"), value=4.0, step=0.1, format="%.1f") / 100
         with c2:
-            erp = st.number_input("Equity risk premium", value=5.0, step=0.1, format="%.1f") / 100
+            erp = st.number_input(T("Equity risk premium (%)", "股票風險溢價（%）"), value=5.0, step=0.1, format="%.1f") / 100
         with c3:
-            beta_input = st.number_input("Beta", value=round(r["beta"], 2), step=0.05, format="%.2f")
+            beta_input = st.number_input(T("Beta", "Beta 係數（貝他係數）"), value=round(min(r["beta"], BETA_CAP), 2),
+                                         step=0.05, format="%.2f")
         with c4:
-            terminal_growth = st.number_input("Terminal growth", value=2.5, step=0.25, format="%.2f") / 100
+            terminal_growth = st.number_input(T("Terminal growth (%)", "永續增長率（%）"), value=2.5, step=0.25, format="%.2f") / 100
 
         cost_of_equity = rf + beta_input * erp
         net_debt = r["debt"] - r["cash"]
@@ -765,20 +809,28 @@ if st.session_state.results:
         after_tax_cost_debt = 0.05 * (1 - r["tax_rate"])
         wacc_calculated = weight_equity * cost_of_equity + (1 - weight_equity) * after_tax_cost_debt
 
-        override_wacc = st.checkbox("Override WACC directly (skip the CAPM calculation above)")
+        override_wacc = st.checkbox(T("Override WACC directly (skip the CAPM calculation above)",
+                                       "直接輸入 WACC（略過上面的 CAPM 計算）"))
         if override_wacc:
-            wacc = st.number_input("Your WACC", value=round(wacc_calculated * 100, 2),
+            wacc = st.number_input(T("Your WACC (%)", "你的 WACC（%）"), value=round(wacc_calculated * 100, 2),
                                     step=0.1, format="%.2f") / 100
             wacc_source = "Your Override"
         else:
             wacc = wacc_calculated
             wacc_source = "Calculated (CAPM)"
 
-        st.caption(
-            f"Beta source: Yahoo Finance live data (yours to override above). "
+        beta_note = (T(f" Yahoo shows {r['beta']:.2f}; the starting value is capped at {BETA_CAP:.1f} because very "
+                       f"high betas often overstate long-term risk after a volatile spell.",
+                       f"Yahoo 顯示為 {r['beta']:.2f}；由於波動期後極高的 Beta 往往高估長期風險，預設值上限為 {BETA_CAP:.1f}。")
+                     if r["beta"] > BETA_CAP else "")
+        st.caption(T(
+            f"Beta source: Yahoo Finance live data (yours to override above).{beta_note} "
             f"Year-1 revenue growth source: **{r['y1_source']}** ({r['growth_y1']:.1%}). "
-            f"WACC source: **{wacc_source}** ({wacc:.2%})."
-        )
+            f"WACC source: **{wacc_source}** ({wacc:.2%}).",
+            f"Beta 來源：Yahoo Finance 即時數據（可在上方修改）。{beta_note}"
+            f"第一年收入增長來源：**{src_label(r['y1_source'])}**（{r['growth_y1']:.1%}）。"
+            f"WACC 來源：**{src_label(wacc_source)}**（{wacc:.2%}）。"
+        ))
 
         growth_path = build_growth_path(r["growth_y1"], r["rev_growth_y2"], terminal_growth)
 
@@ -786,36 +838,39 @@ if st.session_state.results:
                                 r["nwc_pct"], r["tax_rate"], growth_path)
         implied_price = dcf_implied_price(fcf_list, wacc, terminal_growth, net_debt, r["shares"])
 
-        st.subheader("Result")
+        st.subheader(T("Result", "結果"))
         m1, m2, m3 = st.columns(3)
         with m1:
-            metric_card("DCF Implied Price", f"${implied_price:,.2f}" if implied_price else "n/a")
+            metric_card(T("DCF Implied Price", "DCF 隱含股價"), f"${implied_price:,.2f}" if implied_price else "n/a")
         with m2:
-            metric_card("Current Price", f"${r['price']:,.2f}")
+            metric_card(T("Current Price", "現價"), f"${r['price']:,.2f}")
         with m3:
             if implied_price:
                 upside = (implied_price - r["price"]) / r["price"]
-                metric_card("vs. Current", f"{upside:+.1%}")
+                metric_card(T("vs. Current", "相對現價"), f"{upside:+.1%}")
 
         st.write("")
         w_mkt = implied_wacc(r["price"], fcf_list, terminal_growth, net_debt, r["shares"])
         w_tgt = implied_wacc(r.get("target_price"), fcf_list, terminal_growth, net_debt, r["shares"])
         w1, w2, w3 = st.columns(3)
         with w1:
-            metric_card("WACC used", f"{wacc:.2%}", wacc_source)
+            metric_card(T("WACC used", "採用的 WACC"), f"{wacc:.2%}", src_label(wacc_source))
         with w2:
-            metric_card("WACC implied by current price",
+            metric_card(T("WACC implied by current price", "現價隱含的 WACC"),
                         f"{w_mkt:.2%}" if w_mkt is not None else "n/a",
-                        f"Discount rate at which the DCF equals ${r['price']:,.2f}")
+                        T(f"Discount rate at which the DCF equals ${r['price']:,.2f}", f"令 DCF 等於 ${r['price']:,.2f} 的折現率"))
         with w3:
-            tgt_txt = f"${r['target_price']:,.2f}" if r.get("target_price") else "the target"
-            metric_card("WACC implied by consensus target",
+            tgt_txt = f"${r['target_price']:,.2f}" if r.get("target_price") else T("the target", "目標價")
+            metric_card(T("WACC implied by consensus target", "共識目標價隱含的 WACC"),
                         f"{w_tgt:.2%}" if w_tgt is not None else "n/a",
-                        f"Discount rate at which the DCF equals {tgt_txt}")
-        st.caption("Reverse DCF: with the same cash-flow forecast, these are the discount rates the market "
+                        T(f"Discount rate at which the DCF equals {tgt_txt}", f"令 DCF 等於 {tgt_txt} 的折現率"))
+        st.caption(T("Reverse DCF: with the same cash-flow forecast, these are the discount rates the market "
                    "price and the analysts' average target imply. A lower implied WACC than yours means the "
                    "price already assumes more than your forecast; a higher one means it assumes less. "
-                   "n/a means no WACC between terminal growth and 40% produces that price.")
+                   "n/a means no WACC between terminal growth and 40% produces that price.",
+                   "反向 DCF：在同一套現金流預測下，這些是市場價格及分析師平均目標價所隱含的折現率。隱含 WACC 低於你採用的 WACC，"
+                   "代表股價已反映比你的預測更樂觀的假設；高於你的，則代表反映的假設較保守。"
+                   "n/a 表示在永續增長率至 40% 之間，沒有任何 WACC 能得出該價格。"))
 
         # ------------------------------------------------------------------
         # Sensitivity grid - 10x10, matching the Excel template's convention.
@@ -823,9 +878,10 @@ if st.session_state.results:
         # the Excel version) the 4 cells nearest the actual current WACC/growth
         # assumptions get a highlighted border instead of just one cell.
         # ------------------------------------------------------------------
-        st.subheader("Sensitivity grid")
-        st.caption("Price across nearby WACC and terminal growth assumptions. "
-                   "The 4 bordered cells in the middle are closest to your actual current assumptions.")
+        st.subheader(T("Sensitivity grid", "敏感度分析表"))
+        st.caption(T("Price across nearby WACC and terminal growth assumptions. "
+                   "The 4 bordered cells in the middle are closest to your actual current assumptions.",
+                   "不同 WACC 及永續增長率組合下的每股價值。中間四個加框的格最接近你目前的假設。"))
 
         wacc_deltas = [(i - 4.5) * 0.005 for i in range(10)]
         growth_deltas = [(i - 4.5) * 0.0025 for i in range(10)]
@@ -847,7 +903,7 @@ if st.session_state.results:
             index=[f"{g:.2%}" for g in growth_steps],
             columns=[f"{w:.2%}" for w in wacc_steps],
         )
-        grid_df.index.name = "Growth \\ WACC"
+        grid_df.index.name = T("Growth \\ WACC", "增長率 \\ WACC")
 
         def fmt_cell(v):
             return f"${v:,.0f}" if v is not None else "n/a"
@@ -897,20 +953,25 @@ if st.session_state.results:
         )
 
         st.caption(
-            "This is a simplified illustrative calculation - cost ratios (COGS, SG&A, R&D, "
+            T("This is a simplified illustrative calculation - cost ratios (COGS, SG&A, R&D, "
             "capex, working capital) are estimated from the latest reported year and held "
             "flat, same as the free downloadable Excel template's default behavior. "
             "The full template additionally supports peer comparison and persistent "
-            "manual overrides."
+            "manual overrides.",
+              "這是簡化的示範計算：成本比率（銷售成本、銷售及行政開支、研發、資本開支、營運資金）按最近一個財政年度估算並維持不變，"
+              "與可免費下載的 Excel 範本預設做法相同。完整範本另外支援同業比較及保存手動修改。")
         )
     else:
-        st.caption("No DCF data shown for banks and insurers - standard discounted cash flow doesn't map cleanly onto how financial-sector companies "
-                   "report (interest income/expense instead of a normal revenue and cost structure).")
+        st.caption(T("No DCF data shown for banks and insurers - standard discounted cash flow doesn't map cleanly onto how financial-sector companies "
+                   "report (interest income/expense instead of a normal revenue and cost structure).",
+                   "銀行及保險公司不提供 DCF 估值：它們的財務報表以利息收入及支出為主，並沒有一般企業的收入及成本結構，標準現金流折現並不適用。"))
 
 
 st.divider()
-st.caption(
+st.caption(T(
     "© 2026 Stock with Claude. This is not financial advice. "
     "Want the full version with peer comparison and valuation history? "
-    "[Download the free Excel template](https://youtube.com/@stock_with_claude)."
-)
+    "[Download the free Excel template](https://youtube.com/@stock_with_claude).",
+    "© 2026 Stock with Claude。本工具並不構成投資建議。想要包括同業比較及估值歷史的完整版？"
+    "[下載免費 Excel 範本](https://youtube.com/@stock_with_claude)。"
+))
