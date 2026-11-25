@@ -29,6 +29,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import math
+import time
 
 st.set_page_config(page_title="Live DCF Calculator - Stock with Claude", layout="wide")
 
@@ -53,6 +54,7 @@ def T(en, zh):
 
 
 SOURCE_ZH = {"Analyst": "分析師共識", "Trailing (proxy)": "過往增長（替代值）",
+             "Default (assumed)": "預設值（假設）",
              "Your Override": "自行輸入", "Calculated (CAPM)": "按 CAPM 計算"}
 
 
@@ -216,6 +218,88 @@ def build_growth_path(g1, g2, terminal_growth):
             step = (terminal_growth - anchor) / (5 - 1)
             path.append(anchor + step * i)
     return path
+
+
+
+# ---------------------------------------------------------------------------
+# Yahoo company data (profile, target price, consensus estimates), fetched
+# with retries and cached. Yahoo regularly refuses these requests from shared
+# cloud servers such as Streamlit Cloud, while price history still loads.
+# Previously the app then fell back silently to placeholders (5% growth,
+# beta 1.0) and showed them as if they were real. Now: retry, cache good
+# answers for 6 hours, fall back to the last good copy, and otherwise tell
+# the visitor plainly that the analyst data is unavailable.
+# ---------------------------------------------------------------------------
+INFO_KEYS = ("currentPrice", "regularMarketPrice", "sharesOutstanding", "totalDebt", "totalCash",
+             "beta", "targetMeanPrice", "numberOfAnalystOpinions", "forwardPE", "longName",
+             "shortName", "revenueGrowth")
+
+
+class YahooIncomplete(Exception):
+    """Raised inside the cached fetch so a failed Yahoo response is never cached."""
+
+
+def _info_with_retry(t, tries=3):
+    info = {}
+    for i in range(tries):
+        try:
+            info = t.info or {}
+        except Exception:
+            info = {}
+        if info.get("longName") or info.get("shortName") or info.get("beta") is not None:
+            return info, True
+        if i < tries - 1:
+            time.sleep(1.5 * (i + 1))
+    return info, False
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_company_data(ticker):
+    t = yf.Ticker(ticker)
+    info, info_ok = _info_with_retry(t)
+    rev_y1, rev_y2 = fetch_revenue_growth_estimates(t)
+    eps_y1, eps_y2, eps_5y = fetch_eps_growth_estimates(t)
+    if eps_y1 is None and eps_y2 is None:
+        eps_y1, eps_y2 = fetch_eps_growth_from_estimates(t)
+    data = dict(
+        info={k: info.get(k) for k in INFO_KEYS},
+        rev_growth_y1=rev_y1, rev_growth_y2=rev_y2,
+        eps_growth_y1=eps_y1, eps_growth_y2=eps_y2, eps_growth_5y=eps_5y,
+        forward_revenue=fetch_forward_revenue(t),
+        fetched_at=time.time(),
+    )
+    data["analyst_ok"] = any(v is not None for v in (
+        safe_float(info.get("targetMeanPrice")), rev_y1, rev_y2, eps_y1, eps_y2))
+    if not info_ok:
+        # Yahoo did not answer properly: don't cache this, try again next time.
+        raise YahooIncomplete(data)
+    return data
+
+
+@st.cache_resource
+def _last_good_store():
+    """Last complete answer per ticker, shared across visitors until the app restarts."""
+    return {}
+
+
+def get_company_data(ticker):
+    """Returns (data, status). status is "live" (fresh or cached within 6 hours),
+    "stale" (Yahoo not answering now; using the last good copy) or
+    "missing" (Yahoo not answering and nothing saved)."""
+    store = _last_good_store()
+    try:
+        data = fetch_company_data(ticker)
+        store[ticker] = data
+        return data, "live"
+    except YahooIncomplete as e:
+        partial = e.args[0]
+    except Exception:
+        partial = dict(info={}, rev_growth_y1=None, rev_growth_y2=None, eps_growth_y1=None,
+                       eps_growth_y2=None, eps_growth_5y=None, forward_revenue=None,
+                       analyst_ok=False, fetched_at=time.time())
+    if ticker in store:
+        return store[ticker], "stale"
+    return partial, "missing"
 
 
 def implied_wacc(target, fcf_list, terminal_growth, net_debt, shares):
@@ -409,13 +493,11 @@ if calculate and ticker_input:
     with st.spinner(f"Fetching live data for {ticker_input} ..."):
         try:
             t = yf.Ticker(ticker_input)
-            # Yahoo often returns an empty or partial .info to cloud servers
-            # (rate limiting / blocking). Don't let that kill the whole app:
-            # fall back to fast_info and the balance sheet for the essentials.
-            try:
-                info = t.info or {}
-            except Exception:
-                info = {}
+            # Company data (profile, target, estimates) comes from the cached,
+            # retried fetch above. If Yahoo is refusing it, fall back to
+            # fast_info and the balance sheet for the essentials.
+            cdata, data_status = get_company_data(ticker_input)
+            info = cdata["info"]
 
             price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
             shares = safe_float(info.get("sharesOutstanding"))
@@ -439,11 +521,12 @@ if calculate and ticker_input:
                     pass
             debt = safe_float(info.get("totalDebt")) or 0.0
             cash = safe_float(info.get("totalCash")) or 0.0
-            beta = safe_float(info.get("beta")) or 1.0
+            beta_raw = safe_float(info.get("beta"))
+            beta = beta_raw if beta_raw is not None else 1.0
             target_price = safe_float(info.get("targetMeanPrice"))
             n_analysts = info.get("numberOfAnalystOpinions")
             forward_pe = safe_float(info.get("forwardPE"))
-            forward_revenue = fetch_forward_revenue(t)
+            forward_revenue = cdata["forward_revenue"]
             forward_ps = (price * shares / forward_revenue) if (forward_revenue and shares) else None
             company_name = info.get("longName") or info.get("shortName") or ticker_input
 
@@ -456,10 +539,8 @@ if calculate and ticker_input:
                 # target price - fetched regardless of company type, since
                 # none of it depends on the revenue/EBIT structure that
                 # banks and insurers report differently. ---
-                rev_growth_y1, rev_growth_y2 = fetch_revenue_growth_estimates(t)
-                eps_growth_y1, eps_growth_y2, eps_growth_5y = fetch_eps_growth_estimates(t)
-                if eps_growth_y1 is None and eps_growth_y2 is None:
-                    eps_growth_y1, eps_growth_y2 = fetch_eps_growth_from_estimates(t)
+                rev_growth_y1, rev_growth_y2 = cdata["rev_growth_y1"], cdata["rev_growth_y2"]
+                eps_growth_y1, eps_growth_y2 = cdata["eps_growth_y1"], cdata["eps_growth_y2"]
 
                 results = dict(
                     ticker=ticker_input, company_name=company_name, price=price,
@@ -469,6 +550,8 @@ if calculate and ticker_input:
                     rev_growth_y1=rev_growth_y1, rev_growth_y2=rev_growth_y2,
                     eps_growth_y1=eps_growth_y1, eps_growth_y2=eps_growth_y2,
                     dcf_available=False,  # set True below only if DCF data is genuinely usable
+                    data_status=data_status, analyst_ok=cdata["analyst_ok"],
+                    fetched_at=cdata["fetched_at"], beta_missing=beta_raw is None,
                 )
 
                 try:
@@ -507,8 +590,20 @@ if calculate and ticker_input:
                     tax_rate = 0.21
                     ebit_margin = ebit_last / revenue_last
                     rev_growth_trailing = safe_float(info.get("revenueGrowth"))
-                    y1 = rev_growth_y1 if rev_growth_y1 is not None else (rev_growth_trailing or 0.05)
-                    y1_source = "Analyst" if rev_growth_y1 is not None else "Trailing (proxy)"
+                    if rev_growth_trailing is None:
+                        # Yahoo profile missing: use last reported year-on-year revenue growth
+                        try:
+                            prev_rev = safe_float(income_stmt[income_stmt.columns[1]].get("Total Revenue"))
+                            if prev_rev:
+                                rev_growth_trailing = revenue_last / prev_rev - 1
+                        except Exception:
+                            pass
+                    if rev_growth_y1 is not None:
+                        y1, y1_source = rev_growth_y1, "Analyst"
+                    elif rev_growth_trailing is not None:
+                        y1, y1_source = rev_growth_trailing, "Trailing (proxy)"
+                    else:
+                        y1, y1_source = 0.05, "Default (assumed)"
 
                     results.update(dict(
                         dcf_available=True,
@@ -534,6 +629,18 @@ if calculate and ticker_input:
 if st.session_state.results:
     r = st.session_state.results
     st.success(T(f"Loaded: **{r['company_name']}** ({r['ticker']})", f"已載入：**{r['company_name']}**（{r['ticker']}）"))
+    _status = r.get("data_status", "live")
+    if _status == "missing":
+        st.warning(T(
+            "Yahoo Finance isn't returning analyst data right now (target price, consensus estimates, beta). "
+            "This happens from time to time on shared cloud servers. Prices and history below are live; "
+            "please try again in a few minutes for the full picture.",
+            "Yahoo Finance 暫時未有提供分析師數據（目標價、共識預測、Beta 係數）。共用雲端伺服器間中會出現這情況。"
+            "以下股價及歷史數據仍是即時的；請稍後再試以取得完整資料。"))
+    elif _status == "stale":
+        _when = time.strftime("%d %b %Y %H:%M UTC", time.gmtime(r.get("fetched_at", time.time())))
+        st.info(T(f"Yahoo Finance isn't responding right now, so analyst data is from the last successful update ({_when}).",
+                  f"Yahoo Finance 暫時沒有回應，分析師數據來自上一次成功更新（{_when}）。"))
 
     val_hist_df = r.get("val_hist_df")
 
@@ -744,7 +851,14 @@ if st.session_state.results:
     # Consensus growth for years 1-2, fading to 2.5% terminal growth, then
     # walk backwards to the WACC that makes the DCF equal the target price.
     # ------------------------------------------------------------------
-    if r.get("dcf_available"):
+    if r.get("dcf_available") and not r.get("analyst_ok", True):
+        st.subheader(T("What the consensus implies", "共識預測隱含甚麼"))
+        st.info(T("No analyst target or consensus estimates are available for this stock right now, so the "
+                  "reverse-DCF panel is skipped. The calculator below starts from the company's own recent "
+                  "growth instead; set your own assumptions.",
+                  "目前沒有這隻股票的分析師目標價或共識預測，所以略過反向 DCF 面板。下方計算器改以公司近期的實際增長作起點，請自行設定假設。"))
+
+    if r.get("dcf_available") and r.get("analyst_ok", True):
         st.subheader(T("What the consensus implies", "共識預測隱含甚麼"))
         base_tg = 0.025
         base_path = build_growth_path(r["growth_y1"], r["rev_growth_y2"], base_tg)
@@ -823,6 +937,9 @@ if st.session_state.results:
                        f"high betas often overstate long-term risk after a volatile spell.",
                        f"Yahoo 顯示為 {r['beta']:.2f}；由於波動期後極高的 Beta 往往高估長期風險，預設值上限為 {BETA_CAP:.1f}。")
                      if r["beta"] > BETA_CAP else "")
+        if r.get("beta_missing"):
+            beta_note = T(" Yahoo didn't return a beta for this stock, so 1.00 is only a placeholder: set your own.",
+                          "Yahoo 未有提供這隻股票的 Beta，1.00 只是暫用值，請自行設定。")
         st.caption(T(
             f"Beta source: Yahoo Finance live data (yours to override above).{beta_note} "
             f"Year-1 revenue growth source: **{r['y1_source']}** ({r['growth_y1']:.1%}). "
